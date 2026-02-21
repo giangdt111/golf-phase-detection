@@ -19,7 +19,6 @@ build/
 .DS_Store
 
 # Logs / outputs
-output/
 *.log
 
 # Checkpoints and large models
