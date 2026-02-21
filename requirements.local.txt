@@ -1,0 +1,16 @@
+torch
+torchvision
+mmengine>=0.4.0,<1.0.0
+mmcv>=2.0.0,<2.1.0
+mmdet>=3.0.0,<3.1.0
+mmpose>=1.2.0
+ultralytics>=8.1.0
+numpy
+opencv-python
+pillow
+scipy
+matplotlib
+json_tricks
+munkres
+xtcocotools>=1.12
+rich
