@@ -66,6 +66,7 @@ def segment_frame_features(
 ) -> Tuple[Optional[float], Optional[Tuple[float, float]], Optional[Tuple[float, float]]]:
     if model is None:
         return None, None, None
+    h, w = frame.shape[:2]
     res = model.predict(
         frame,
         imgsz=imgsz,
@@ -90,7 +91,10 @@ def segment_frame_features(
     if shaft_idx:
         areas = [float(masks[i].sum()) for i in shaft_idx]
         sel = shaft_idx[int(np.argmax(areas))]
-        m = (masks[sel] > 0.5)
+        m = (masks[sel] > 0.5).astype(np.uint8)
+        if m.shape[0] != h or m.shape[1] != w:
+            m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+        m = m > 0
         ys, xs = np.where(m)
         if ys.size > 0:
             shaft_center = (float(xs.mean()), float(ys.mean()))
@@ -108,7 +112,10 @@ def segment_frame_features(
     if head_idx:
         areas = [float(masks[i].sum()) for i in head_idx]
         sel = head_idx[int(np.argmax(areas))]
-        m = (masks[sel] > 0.5)
+        m = (masks[sel] > 0.5).astype(np.uint8)
+        if m.shape[0] != h or m.shape[1] != w:
+            m = cv2.resize(m, (w, h), interpolation=cv2.INTER_NEAREST)
+        m = m > 0
         ys, xs = np.where(m)
         if ys.size > 0:
             head_center = (float(xs.mean()), float(ys.mean()))

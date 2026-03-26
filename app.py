@@ -37,6 +37,21 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val.lower() in ("1", "true", "yes", "y", "on")
 
 
+VIDEO_EXTENSIONS = (".mov", ".mp4", ".avi", ".mkv", ".m4v", ".webm")
+
+
+def _videos_from_dir(path: str):
+    """Yield paths to video files in directory (non-recursive)."""
+    if not os.path.isdir(path):
+        return
+    for name in sorted(os.listdir(path)):
+        if name.startswith("."):
+            continue
+        p = os.path.join(path, name)
+        if os.path.isfile(p) and os.path.splitext(name)[1].lower() in VIDEO_EXTENSIONS:
+            yield p
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Infer 2D skeleton keypoints and swing events from a video."
@@ -44,7 +59,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--video",
         default=os.getenv("VIDEO_PATH", "video_raw/IMG_6850_1.MOV"),
-        help="Path to input video (env: VIDEO_PATH).",
+        help="Path to a single input video (env: VIDEO_PATH). Ignored if --input-dir is set.",
+    )
+    parser.add_argument(
+        "--input-dir",
+        default=None,
+        metavar="DIR",
+        help="Process all video files in this directory instead of a single --video.",
     )
     parser.add_argument(
         "--pose2d",
@@ -185,6 +206,93 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _run_one(args: argparse.Namespace) -> None:
+    """Run inference and overlay for a single video. args.video must be set."""
+    video_base = os.path.splitext(os.path.basename(args.video))[0]
+    output_root = os.getenv("OUTPUT_ROOT", "output")
+    output_dir = os.path.join(output_root, video_base)
+    os.makedirs(output_dir, exist_ok=True)
+    out = args.out if args.out else os.path.join(output_dir, "swing_result.json")
+    overlay_out = args.overlay_out if args.overlay_out else os.path.join(output_dir, "swing_overlay.mp4")
+    phase_frames_out = args.phase_frames_out if args.phase_frames_out else os.path.join(output_dir, "phase_frames")
+
+    service = SwingInferenceService()
+    seg_model_path = None if args.seg_disable else args.seg_model
+
+    result = service.run(
+        video_path=args.video,
+        pose2d=args.pose2d,
+        pose2d_weights=args.pose2d_weights,
+        det_model=args.det_model,
+        det_weights=args.det_weights,
+        device=args.device,
+        stride=args.stride,
+        max_frames=args.max_frames,
+        event_mode=args.event_mode,
+        swing_direction=args.swing_direction,
+        seg_model_path=seg_model_path,
+        seg_imgsz=args.seg_imgsz,
+        seg_conf=args.seg_conf,
+        seg_iou=args.seg_iou,
+        seg_device=args.seg_device,
+        person_det_model=args.person_det_model,
+        person_det_conf=args.person_det_conf,
+        person_det_iou=args.person_det_iou,
+        person_det_imgsz=args.person_det_imgsz,
+        force_yolo_person=args.force_yolo_person,
+    )
+
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+    print(f"Wrote {out}")
+
+    seg_model = None if args.seg_disable else init_seg_model(args.seg_model)
+    events_for_render = result.get("events")
+    slow_out = os.path.splitext(overlay_out)[0] + "_slow4x.mp4"
+    render_overlay(
+        args.video,
+        out,
+        slow_out,
+        args.overlay_score_thr,
+        slow_factor=4,
+        events_override=events_for_render,
+        seg_model=seg_model,
+        seg_imgsz=args.seg_imgsz,
+        seg_conf=args.seg_conf,
+        seg_iou=args.seg_iou,
+        seg_device=args.seg_device,
+        seg_alpha=args.seg_alpha,
+        det_model=args.det_model,
+        det_weights=args.det_weights,
+        det_device=args.device,
+        det_debug=args.det_debug,
+        person_det_model=args.person_det_model,
+        person_det_conf=args.person_det_conf,
+        person_det_iou=args.person_det_iou,
+        person_det_imgsz=args.person_det_imgsz,
+    )
+    print(f"Wrote {slow_out}")
+
+    frame_map = {int(item["frame"]): item.get("keypoints") for item in result.get("frames", [])}
+    edges = result.get("skeleton", {}).get("edges")
+    write_phase_frames(
+        args.video,
+        events_for_render or [],
+        phase_frames_out,
+        frame_map=frame_map,
+        edges=edges,
+        score_thr=args.overlay_score_thr,
+        seg_model=seg_model,
+        seg_imgsz=args.seg_imgsz,
+        seg_conf=args.seg_conf,
+        seg_iou=args.seg_iou,
+        seg_device=args.seg_device,
+        seg_classes=[0, 1],
+        seg_alpha=args.seg_alpha,
+    )
+    print(f"Wrote phase frames to {phase_frames_out}")
+
+
 def main() -> None:
     _load_env_file()
     args = parse_args()
@@ -226,95 +334,19 @@ def main() -> None:
             except Exception:
                 print("[WARN] Seg device CUDA requested but torch is missing/unusable. Using cpu.")
                 args.seg_device = "cpu"
-    if not os.path.exists(args.video):
-        raise SystemExit(f"Video not found: {args.video}")
 
-    video_base = os.path.splitext(os.path.basename(args.video))[0]
-    output_root = os.getenv("OUTPUT_ROOT", "output")
-    output_dir = os.path.join(output_root, video_base)
-    os.makedirs(output_dir, exist_ok=True)
-    if args.out is None:
-        args.out = os.path.join(output_dir, "swing_result.json")
-    if args.overlay_out is None:
-        args.overlay_out = os.path.join(output_dir, "swing_overlay.mp4")
-    if args.phase_frames_out is None:
-        args.phase_frames_out = os.path.join(output_dir, "phase_frames")
+    if args.input_dir is not None:
+        video_paths = list(_videos_from_dir(args.input_dir))
+        if not video_paths:
+            raise SystemExit(f"No video files found in directory: {args.input_dir}")
+        args.out = args.overlay_out = args.phase_frames_out = None
+    else:
+        if not os.path.exists(args.video):
+            raise SystemExit(f"Video not found: {args.video}")
+        video_paths = [args.video]
 
-    service = SwingInferenceService()
-    seg_model_path = None if args.seg_disable else args.seg_model
-
-    result = service.run(
-        video_path=args.video,
-        pose2d=args.pose2d,
-        pose2d_weights=args.pose2d_weights,
-        det_model=args.det_model,
-        det_weights=args.det_weights,
-        device=args.device,
-        stride=args.stride,
-        max_frames=args.max_frames,
-        event_mode=args.event_mode,
-        swing_direction=args.swing_direction,
-        seg_model_path=seg_model_path,
-        seg_imgsz=args.seg_imgsz,
-        seg_conf=args.seg_conf,
-        seg_iou=args.seg_iou,
-        seg_device=args.seg_device,
-        person_det_model=args.person_det_model,
-        person_det_conf=args.person_det_conf,
-        person_det_iou=args.person_det_iou,
-        person_det_imgsz=args.person_det_imgsz,
-        force_yolo_person=args.force_yolo_person,
-    )
-
-    with open(args.out, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2)
-    print(f"Wrote {args.out}")
-
-    seg_model = None if args.seg_disable else init_seg_model(args.seg_model)
-    events_for_render = result.get("events")
-    slow_out = os.path.splitext(args.overlay_out)[0] + "_slow4x.mp4"
-    render_overlay(
-        args.video,
-        args.out,
-        slow_out,
-        args.overlay_score_thr,
-        slow_factor=4,
-        events_override=events_for_render,
-        seg_model=seg_model,
-        seg_imgsz=args.seg_imgsz,
-        seg_conf=args.seg_conf,
-        seg_iou=args.seg_iou,
-        seg_device=args.seg_device,
-        seg_alpha=args.seg_alpha,
-        det_model=args.det_model,
-        det_weights=args.det_weights,
-        det_device=args.device,
-        det_debug=args.det_debug,
-        person_det_model=args.person_det_model,
-        person_det_conf=args.person_det_conf,
-        person_det_iou=args.person_det_iou,
-        person_det_imgsz=args.person_det_imgsz,
-    )
-    print(f"Wrote {slow_out}")
-
-    frame_map = {int(item["frame"]): item.get("keypoints") for item in result.get("frames", [])}
-    edges = result.get("skeleton", {}).get("edges")
-    write_phase_frames(
-        args.video,
-        events_for_render or [],
-        args.phase_frames_out,
-        frame_map=frame_map,
-        edges=edges,
-        score_thr=args.overlay_score_thr,
-        seg_model=seg_model,
-        seg_imgsz=args.seg_imgsz,
-        seg_conf=args.seg_conf,
-        seg_iou=args.seg_iou,
-        seg_device=args.seg_device,
-        seg_classes=[0, 1],
-        seg_alpha=args.seg_alpha,
-    )
-    print(f"Wrote phase frames to {args.phase_frames_out}")
+    for args.video in video_paths:
+        _run_one(args)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+setuptools>=65.0.0,<82
 torch
 torchvision
 mmengine>=0.4.0,<1.0.0
@@ -5,7 +6,7 @@ mmcv>=2.0.0,<2.1.0
 mmdet>=3.0.0,<3.1.0
 mmpose>=1.2.0
 ultralytics>=8.1.0
-numpy
+numpy>=1.20.0,<2.0.0
 opencv-python
 pillow
 scipy
@@ -14,3 +15,4 @@ json_tricks
 munkres
 xtcocotools>=1.12
 rich
+aio_pika>=9.4.0
