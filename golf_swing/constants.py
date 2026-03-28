@@ -32,14 +32,3 @@ COCO_SKELETON_EDGES = [
     [12, 14],
     [14, 16],
 ]
-
-SWING_EVENT_NAMES = [
-    "address",
-    "toe-up",
-    "mid-backswing",
-    "top",
-    "mid-downswing",
-    "impact",
-    "mid-follow-through",
-    "finish",
-]

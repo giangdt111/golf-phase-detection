@@ -9,7 +9,7 @@ import os
 
 from golf_swing.pipeline import SwingInferenceService
 from golf_swing.segmentation import init_seg_model
-from golf_swing.overlay import render_overlay, write_phase_frames
+from golf_swing.overlay import render_overlay
 
 
 def _load_env_file(path: str = ".env") -> None:
@@ -106,12 +106,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("MAX_FRAMES", "0")) or None,
         help="Max frames to run (env: MAX_FRAMES). 0 means no limit.",
-    )
-    parser.add_argument(
-        "--event-mode",
-        default=os.getenv("EVENT_MODE", "rule9"),
-        choices=["rule", "rule9"],
-        help="How to detect swing events.",
     )
     parser.add_argument("--out", default=None, help="Output JSON path.")
     parser.add_argument("--overlay-out", default=None, help="Output overlay video path.")
@@ -296,10 +290,11 @@ def _run_one(args: argparse.Namespace) -> None:
 def main() -> None:
     _load_env_file()
     args = parse_args()
+    args.video = os.path.abspath(args.video)
     # Optional hard-coded override (set to a path string to force a specific video).
     input_video_path = None
     if input_video_path is not None:
-        args.video = input_video_path
+        args.video = os.path.abspath(input_video_path)
     # Auto-pick GPU if available and user did not force a device.
     if args.device is None:
         try:
@@ -335,18 +330,93 @@ def main() -> None:
                 print("[WARN] Seg device CUDA requested but torch is missing/unusable. Using cpu.")
                 args.seg_device = "cpu"
 
-    if args.input_dir is not None:
+    # Batch mode if input_dir is set, otherwise single video.
+    if getattr(args, "input_dir", None) is not None:
         video_paths = list(_videos_from_dir(args.input_dir))
         if not video_paths:
             raise SystemExit(f"No video files found in directory: {args.input_dir}")
+        # When processing a directory, override any user-provided output paths.
         args.out = args.overlay_out = args.phase_frames_out = None
     else:
         if not os.path.exists(args.video):
             raise SystemExit(f"Video not found: {args.video}")
         video_paths = [args.video]
 
-    for args.video in video_paths:
-        _run_one(args)
+    for video_path in video_paths:
+        args.video = video_path
+        video_base = os.path.splitext(os.path.basename(args.video))[0]
+        output_root = os.path.abspath(os.getenv("OUTPUT_ROOT", "output"))
+        output_dir = os.path.join(output_root, video_base)
+        os.makedirs(output_dir, exist_ok=True)
+        if args.out is None:
+            args.out = os.path.join(output_dir, "swing_result.json")
+        else:
+            args.out = os.path.abspath(args.out)
+        if args.overlay_out is None:
+            args.overlay_out = os.path.join(output_dir, "swing_overlay.mp4")
+        else:
+            args.overlay_out = os.path.abspath(args.overlay_out)
+        service = SwingInferenceService()
+        seg_model_path = None if args.seg_disable else args.seg_model
+
+        result = service.run(
+            video_path=args.video,
+            pose2d=args.pose2d,
+            pose2d_weights=args.pose2d_weights,
+            det_model=args.det_model,
+            det_weights=args.det_weights,
+            device=args.device,
+            stride=args.stride,
+            max_frames=args.max_frames,
+            swing_direction=args.swing_direction,
+            seg_model_path=seg_model_path,
+            seg_imgsz=args.seg_imgsz,
+            seg_conf=args.seg_conf,
+            seg_iou=args.seg_iou,
+            seg_device=args.seg_device,
+            person_det_model=args.person_det_model,
+            person_det_conf=args.person_det_conf,
+            person_det_iou=args.person_det_iou,
+            person_det_imgsz=args.person_det_imgsz,
+            force_yolo_person=args.force_yolo_person,
+            # Enable debug P9 by env flag
+            debug_p9=True,
+            debug_p9_path=os.path.join(output_dir, "phase_debug.csv"),
+        )
+
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+        with open(args.out, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
+        print(f"Wrote {args.out}")
+
+        seg_model = None if args.seg_disable else init_seg_model(args.seg_model)
+        render_video_path = os.path.abspath(result.get("video", {}).get("path", args.video))
+        slow_out = os.path.splitext(args.overlay_out)[0] + "_slow4x.mp4"
+        phase_frames_dir = os.path.join(output_dir, "phase_frames")
+        render_overlay(
+            render_video_path,
+            args.out,
+            slow_out,
+            args.overlay_score_thr,
+            slow_factor=4,
+            seg_model=seg_model,
+            seg_imgsz=args.seg_imgsz,
+            seg_conf=args.seg_conf,
+            seg_iou=args.seg_iou,
+            seg_device=args.seg_device,
+            seg_alpha=args.seg_alpha,
+            det_model=args.det_model,
+            det_weights=args.det_weights,
+            det_device=args.device,
+            det_debug=args.det_debug,
+            person_det_model=args.person_det_model,
+            person_det_conf=args.person_det_conf,
+            person_det_iou=args.person_det_iou,
+            person_det_imgsz=args.person_det_imgsz,
+            phase_frames_out=phase_frames_dir,
+        )
+        print(f"Wrote {slow_out}")
+        print(f"Phase frames saved to {phase_frames_dir}")
 
 
 if __name__ == "__main__":

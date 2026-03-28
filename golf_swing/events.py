@@ -4,7 +4,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .constants import COCO_KEYPOINT_NAMES, COCO_SKELETON_EDGES, SWING_EVENT_NAMES
+from .constants import COCO_KEYPOINT_NAMES
 
 
 @dataclass
@@ -171,7 +171,7 @@ def infer_swing_direction(frames: List[FramePose]) -> Optional[str]:
     return "clockwise" if (top_x - start_x) > 0 else "counterclockwise"
 
 
-# --- swing feature extraction & rule detectors ---
+# --- swing feature extraction used by the 9-phase detector ---
 # (Content kept verbatim for correctness; only minor packaging tweaks.)
 
 # The large helper set below was moved from the original script without logic changes.
@@ -346,20 +346,13 @@ def compute_swing_features(
         "right_hip": right_hip,
         "left_wrist": left_wrist,
         "left_hip": left_hip,
-        "lead_is_right": np.array([lead_is_right], dtype=bool),
+        "left_elbow": left_elbow,
+        "right_elbow": right_elbow,
+        "lead_is_right": np.full(n, lead_is_right, dtype=bool),
     }
 
 
-# === Event detectors (rule and rule9) ===
-# Due to length, the following functions are copied directly.
-
-# (For brevity, not reflowing docstrings. Logic unchanged.)
-
-def detect_events_rule(frames: List[FramePose], fps: float) -> List[Dict[str, float]]:
-    from .events_logic import detect_events_rule  # type: ignore
-    return detect_events_rule(frames, fps)
-
-
+# === Event detector entrypoint ===
 def detect_events_rule9(
     frames: List[FramePose],
     fps: float,
@@ -367,7 +360,7 @@ def detect_events_rule9(
     shaft_angles: List[Optional[float]],
     club_centers: List[Optional[Tuple[float, float]]],
     shaft_centers: List[Optional[Tuple[float, float]]],
-) -> List[Dict[str, float]]:
+):
     from .events_logic import detect_events_rule9  # type: ignore
     return detect_events_rule9(
         frames,
