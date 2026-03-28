@@ -1,721 +1,480 @@
-"""Rule-based swing event detectors extracted from original script."""
+"""Rule-based 9-phase swing event detector."""
 from typing import Dict, List, Optional, Tuple
 import math
 import numpy as np
 
-from .events import FramePose, safe_point, moving_average, compute_swing_features
+from .events import FramePose, compute_swing_features
 
 
-def detect_events_rule(frames: List[FramePose], fps: float) -> List[Dict[str, float]]:
-    if not frames:
-        return []
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-    wrist_y = []
-    hip_y = []
-    for frame in frames:
-        kpts = frame.keypoints
-        lw = safe_point(kpts, 9)
-        rw = safe_point(kpts, 10)
-        lh = safe_point(kpts, 11)
-        rh = safe_point(kpts, 12)
-        if lw is None and rw is None:
-            wrist_y.append(None)
-        else:
-            y = []
-            if lw is not None:
-                y.append(lw[1])
-            if rw is not None:
-                y.append(rw[1])
-            wrist_y.append(float(sum(y) / len(y)))
-        if lh is None and rh is None:
-            hip_y.append(None)
-        else:
-            y = []
-            if lh is not None:
-                y.append(lh[1])
-            if rh is not None:
-                y.append(rh[1])
-            hip_y.append(float(sum(y) / len(y)))
+def _estimate_body_scale(features: Dict[str, np.ndarray]) -> float:
+    """Median shoulder/ankle span in pixels — used to normalize thresholds."""
+    spans = []
+    for la, ra in zip(features["left_ankle"], features["right_ankle"]):
+        if not (np.any(np.isnan(la)) or np.any(np.isnan(ra))):
+            spans.append(float(np.linalg.norm(la - ra)))
+    for ls, rs in zip(features["left_shoulder"], features["right_shoulder"]):
+        if not (np.any(np.isnan(ls)) or np.any(np.isnan(rs))):
+            spans.append(float(np.linalg.norm(ls - rs) * 1.8))
+    return max(1.0, float(np.median(spans))) if spans else 120.0
 
-    filled_wrist = [v for v in wrist_y if v is not None]
-    if not filled_wrist:
-        return []
-    fallback = sum(filled_wrist) / len(filled_wrist)
-    wrist_y = [fallback if v is None else v for v in wrist_y]
-    hip_filled = [v for v in hip_y if v is not None]
-    hip_fallback = sum(hip_filled) / len(hip_filled) if hip_filled else fallback
-    hip_y = [hip_fallback if v is None else v for v in hip_y]
 
-    wrist_y = moving_average(wrist_y, window=7)
-    speeds = [0.0]
-    for i in range(1, len(wrist_y)):
-        speeds.append(abs(wrist_y[i] - wrist_y[i - 1]))
-
-    # Address: first low-motion frame in the first 20%
-    addr_idx = 0
-    first_window = max(1, int(len(frames) * 0.2))
-    speed_sorted = sorted(speeds[:first_window])
-    speed_thr = speed_sorted[max(0, len(speed_sorted) // 3)]
-    for i in range(first_window):
-        if speeds[i] <= speed_thr:
-            addr_idx = i
-            break
-
-    # Top: highest hands (min y)
-    top_idx = int(np.argmin(wrist_y))
-    if top_idx < addr_idx:
-        top_idx = max(addr_idx, top_idx)
-
-    # Impact: after top, hands near hip height while descending
-    impact_idx = top_idx
-    best = math.inf
-    for i in range(top_idx + 1, len(frames)):
-        if wrist_y[i] >= wrist_y[i - 1]:
-            diff = abs(wrist_y[i] - hip_y[i])
-            if diff < best:
-                best = diff
-                impact_idx = i
-
-    # Finish: last low-motion frame in final 20%
-    finish_idx = len(frames) - 1
-    last_window = max(1, int(len(frames) * 0.2))
-    speed_sorted = sorted(speeds[-last_window:])
-    speed_thr = speed_sorted[max(0, len(speed_sorted) // 3)]
-    for i in range(len(frames) - last_window, len(frames)):
-        if speeds[i] <= speed_thr:
-            finish_idx = i
-            break
-
-    def _interp(a: int, b: int, ratio: float) -> int:
-        return int(round(a + (b - a) * ratio))
-
-    toe_up_idx = _interp(addr_idx, top_idx, 0.3)
-    mid_backswing_idx = _interp(addr_idx, top_idx, 0.6)
-    mid_downswing_idx = _interp(top_idx, impact_idx, 0.5)
-    mid_follow_idx = _interp(impact_idx, finish_idx, 0.5)
-
-    events = [
-        ("address", addr_idx),
-        ("toe-up", toe_up_idx),
-        ("mid-backswing", mid_backswing_idx),
-        ("top", top_idx),
-        ("mid-downswing", mid_downswing_idx),
-        ("impact", impact_idx),
-        ("mid-follow-through", mid_follow_idx),
-        ("finish", finish_idx),
-    ]
-
-    out = []
-    for name, idx in events:
-        idx = max(0, min(len(frames) - 1, idx))
-        out.append({"name": name, "frame": idx, "t": idx / fps})
+def _normalize_cost(values: List[float]) -> np.ndarray:
+    arr = np.asarray(values, dtype=float)
+    out = np.full(arr.shape, np.inf, dtype=float)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return out
+    lo = float(np.percentile(arr[finite], 10))
+    hi = float(np.percentile(arr[finite], 90))
+    out[finite] = np.clip((arr[finite] - lo) / max(hi - lo, 1e-6), 0.0, 8.0)
     return out
 
 
-# The long-form rule9 detector remains mostly verbatim for correctness.
+def _argmin_range(arr: np.ndarray, i0: int, i1: int) -> int:
+    """Index of minimum finite value in arr[i0:i1+1]. Returns i0 if none finite."""
+    if i1 < i0:
+        return i0
+    seg = arr[i0:i1 + 1]
+    return i0 + (int(np.nanargmin(seg)) if np.isfinite(seg).any() else 0)
 
-def detect_events_rule9(
+
+def _find_extrema(arr: np.ndarray, min_delta: float = 10.0):
+    """
+    Duyệt toàn bộ tín hiệu, tìm tất cả đỉnh (peak) và đáy (trough) theo thứ tự.
+    Chỉ tính extremum khi tín hiệu đã đổi chiều ít nhất min_delta độ.
+    Trả về list of (index, 'peak'|'trough').
+    """
+    filled = _fill(np.where(np.isfinite(arr), arr, np.nan))
+    n = len(filled)
+    extrema = []
+    direction = 0          # +1 đang tăng, -1 đang giảm, 0 chưa xác định
+    ref_idx = 0
+    ref_val = float(filled[0])
+
+    for i in range(1, n):
+        v = float(filled[i])
+        if direction == 0:
+            if v - ref_val >= min_delta:
+                direction = 1;  ref_idx, ref_val = i, v
+            elif ref_val - v >= min_delta:
+                direction = -1; ref_idx, ref_val = i, v
+        elif direction == 1:          # đang tăng, theo dõi max
+            if v >= ref_val:
+                ref_idx, ref_val = i, v
+            elif ref_val - v >= min_delta:
+                extrema.append((ref_idx, 'peak'))
+                direction = -1; ref_idx, ref_val = i, v
+        else:                         # đang giảm, theo dõi min
+            if v <= ref_val:
+                ref_idx, ref_val = i, v
+            elif v - ref_val >= min_delta:
+                extrema.append((ref_idx, 'trough'))
+                direction = 1;  ref_idx, ref_val = i, v
+    return extrema
+
+
+def _next_extremum(extrema, after: int, kind: str, fallback: int) -> int:
+    """Trả về index của extremum đầu tiên có type=kind xuất hiện sau `after`."""
+    for idx, t in extrema:
+        if idx > after and t == kind:
+            return idx
+    return fallback
+
+
+def _fill(arr: np.ndarray) -> np.ndarray:
+    """Linear interpolation over NaN gaps; edge-fills beyond detected range."""
+    arr = arr.copy().astype(float)
+    finite = np.isfinite(arr)
+    if not finite.any():
+        return arr
+    idx = np.arange(arr.size)
+    arr[~finite] = np.interp(idx[~finite], idx[finite], arr[finite])
+    return arr
+
+
+def _smooth(arr: np.ndarray, w: int = 5) -> np.ndarray:
+    """Median smoothing with window w."""
+    out = arr.copy()
+    half = max(1, w // 2)
+    for i in range(arr.size):
+        seg = arr[max(0, i - half):min(arr.size, i + half + 1)]
+        seg = seg[np.isfinite(seg)]
+        if seg.size:
+            out[i] = float(np.median(seg))
+    return out
+
+
+def _midpoint_xy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Element-wise midpoint; NaN when either point is NaN."""
+    out = np.full_like(a, np.nan)
+    valid = np.isfinite(a).all(axis=1) & np.isfinite(b).all(axis=1)
+    out[valid] = (a[valid] + b[valid]) / 2.0
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Signal computation  ←  the 4 things we track
+# ---------------------------------------------------------------------------
+
+def _compute_signals(
+    shaft_angles: List[Optional[float]],
+    shaft_centers: List[Optional[Tuple[float, float]]],
+    features: Dict[str, np.ndarray],
+    n: int,
+    body_scale: float,
+) -> Dict[str, np.ndarray]:
+    """Compute the four per-frame signals that drive phase detection.
+
+    Signals (match exactly what is visible on the overlay video):
+
+    1. shaft_angle  [0°, 90°]
+           Angle of the club from horizontal.
+           0° = shaft lies flat / horizontal.
+           90° = shaft stands straight up / vertical.
+
+    2. direction  (encoded as dir_up / dir_dn bool arrays)
+           Whether the grip (yellow dot) is moving UP or DOWN.
+           UP  = grip_y decreasing (hands rising).
+           DOWN = grip_y increasing (hands falling).
+
+    3. hip_xy, chest_xy, shoulder_xy  [n, 2]
+           Coordinates of the three body-center points drawn on the video.
+
+    4. grip_xy  [n, 2]
+           Coordinates of the yellow grip dot (mid-wrist projected on shaft).
+    """
+
+    # ---- 1. Shaft angle ----
+    def _to_horiz(a) -> float:
+        v = float(abs(a) % 180.0)
+        return min(v, 180.0 - v)   # [0°,180°) → [0°,90°]
+
+    sa_raw = np.array([
+        _to_horiz(a) if (a is not None and np.isfinite(float(a))) else np.nan
+        for a in shaft_angles
+    ], dtype=float)
+    shaft_angle = _smooth(_fill(sa_raw), w=5)
+
+    # ---- 2. Body center points ----
+    left_shoulder  = features['left_shoulder']   # [n,2]
+    right_shoulder = features['right_shoulder']
+    left_hip       = features['left_hip']
+    right_hip      = features['right_hip']
+    left_wrist     = features['left_wrist']
+    right_wrist    = features['right_wrist']
+
+    shoulder_xy = _midpoint_xy(left_shoulder, right_shoulder)
+    hip_xy      = _midpoint_xy(left_hip,      right_hip)
+    chest_xy    = (2 * shoulder_xy + hip_xy) / 3  # P = (2M + N)/3, NP = 2·PM
+
+    # ---- 3. Grip point = trung điểm H1, H2 ----
+    # d1 = đường thẳng qua left_elbow → left_wrist
+    # d2 = đường thẳng qua right_elbow → right_wrist
+    # H1 = giao điểm d1 với shaft line
+    # H2 = giao điểm d2 với shaft line
+    # grip = (H1 + H2) / 2  (hoặc Hi nếu chỉ 1 tay detect được)
+    def _intersect_forearm_shaft(elbow, wrist, cx, cy, vx, vy, max_dist):
+        """Giao điểm của đường thẳng (elbow→wrist) với shaft line qua (cx,cy) hướng (vx,vy).
+        Trả về None nếu giao điểm cách wrist > max_dist (tay không hướng về gậy).
+        Nếu 2 đường song song, fallback chiếu vuông góc wrist lên shaft."""
+        dx = wrist[0] - elbow[0]
+        dy = wrist[1] - elbow[1]
+        det = vx * dy - vy * dx
+        if abs(det) < 1e-6:
+            t = (wrist[0] - cx) * vx + (wrist[1] - cy) * vy
+        else:
+            t = (dx * (cy - elbow[1]) - dy * (cx - elbow[0])) / det
+        H = np.array([cx + t * vx, cy + t * vy])
+        if float(np.linalg.norm(H - wrist)) > max_dist:
+            return None
+        return H
+
+    left_elbow  = features['left_elbow']
+    right_elbow = features['right_elbow']
+    _grip_max_dist = 0.2 * body_scale
+
+    grip_xy = np.full((n, 2), np.nan)
+    for i in range(n):
+        lw = left_wrist[i];  le = left_elbow[i]
+        rw = right_wrist[i]; re = right_elbow[i]
+        l_ok = np.isfinite(lw).all() and np.isfinite(le).all()
+        r_ok = np.isfinite(rw).all() and np.isfinite(re).all()
+        if not l_ok and not r_ok:
+            continue
+        sc = shaft_centers[i]
+        sa = float(shaft_angle[i])
+        if sc is not None and np.isfinite(sa):
+            cx, cy = float(sc[0]), float(sc[1])
+            rad = math.radians(sa)
+            vx, vy = math.cos(rad), math.sin(rad)
+            H1 = _intersect_forearm_shaft(le, lw, cx, cy, vx, vy, _grip_max_dist) if l_ok else None
+            H2 = _intersect_forearm_shaft(re, rw, cx, cy, vx, vy, _grip_max_dist) if r_ok else None
+            if H1 is not None and H2 is not None:
+                grip_xy[i] = (H1 + H2) / 2.0
+            elif H1 is not None:
+                grip_xy[i] = H1
+            elif H2 is not None:
+                grip_xy[i] = H2
+            # else: cả 2 tay đều không hướng về gậy → NaN
+        else:
+            # Fallback khi không có shaft: dùng trung điểm wrist thô
+            if l_ok and r_ok:
+                grip_xy[i] = (lw + rw) / 2.0
+            elif l_ok:
+                grip_xy[i] = lw.copy()
+            else:
+                grip_xy[i] = rw.copy()
+
+    grip_x = _smooth(_fill(grip_xy[:, 0]), w=5)
+    grip_y = _smooth(_fill(grip_xy[:, 1]), w=5)
+    grip_xy_smooth = np.column_stack([grip_x, grip_y])
+
+    # ---- 4. Direction — UP/DOWN from grip Y movement (LAG-based) ----
+    LAG = max(5, n // 15)
+    grip_dy = np.zeros(n, dtype=float)
+    for i in range(n):
+        lo = max(0, i - LAG)
+        hi = min(n - 1, i + LAG)
+        if hi > lo:
+            grip_dy[i] = (grip_y[hi] - grip_y[lo]) / (hi - lo)
+    thr = max(0.3, 0.004 * body_scale)
+    dir_up = grip_dy < -thr
+    dir_dn = grip_dy > thr
+
+    # ---- Hip angle: góc nhọn giữa đường hông và phương ngang [0°, 90°] ----
+    hip_angle = np.full(n, np.nan)
+    for i in range(n):
+        lh = left_hip[i]
+        rh = right_hip[i]
+        if np.isfinite(lh).all() and np.isfinite(rh).all():
+            dx = abs(rh[0] - lh[0])
+            dy = abs(rh[1] - lh[1])
+            hip_angle[i] = math.degrees(math.atan2(dy, dx))
+    hip_angle = _smooth(_fill(hip_angle), w=5)
+
+    return dict(
+        shaft_angle=shaft_angle,
+        shaft_angle_raw=sa_raw,
+        dir_up=dir_up,
+        dir_dn=dir_dn,
+        grip_dy=grip_dy,
+        hip_xy=hip_xy,
+        chest_xy=chest_xy,
+        shoulder_xy=shoulder_xy,
+        grip_xy=grip_xy_smooth,
+        hip_angle=hip_angle,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Phase detection
+# ---------------------------------------------------------------------------
+
+PHASE_NAMES = [
+    'Address', 'Mid-backswing', 'Late-backswing', 'Top-backswing',
+    'Early-downswing', 'Mid-downswing', 'Ball-impact',
+    'Mid-followthrough', 'Late-followthrough',
+]
+
+
+def detect_swing_phases(
     frames: List[FramePose],
     fps: float,
     swing_direction: Optional[str],
     shaft_angles: List[Optional[float]],
     club_centers: List[Optional[Tuple[float, float]]],
     shaft_centers: List[Optional[Tuple[float, float]]],
+    debug: bool = False,
+    debug_path: str = "phase_debug.csv",
 ) -> List[Dict[str, float]]:
+    """Detect golf swing phases sequentially."""
     if not frames:
         return []
-    n = len(frames)
+
     features = compute_swing_features(frames, swing_direction=swing_direction)
     frame_ids = [f.frame_id for f in frames]
-    times = [f.t for f in frames]
+    times     = [f.t       for f in frames]
 
-    def _interpolate_angles(angles: List[Optional[float]]) -> List[float]:
-        out = [float("nan")] * n
-        for i in range(n):
-            ang = angles[i]
-            if ang is None or not np.isfinite(ang):
-                continue
-            out[i] = float(abs(ang) % 180.0)
-        valid = [i for i, v in enumerate(out) if np.isfinite(v)]
-        if not valid:
-            return out
-        for i in range(n):
-            if np.isfinite(out[i]):
-                continue
-            prev = max([j for j in valid if j < i], default=None)
-            nxt = min([j for j in valid if j > i], default=None)
-            if prev is None:
-                out[i] = out[nxt]
-            elif nxt is None:
-                out[i] = out[prev]
-            else:
-                ratio = (i - prev) / (nxt - prev)
-                out[i] = out[prev] + (out[nxt] - out[prev]) * ratio
-        return out
+    n = min(len(frames), len(shaft_angles), len(shaft_centers),
+            *(len(v) for v in features.values() if hasattr(v, '__len__')))
+    if n <= 0:
+        return []
 
-    shaft_angles_interp = _interpolate_angles(shaft_angles)
+    frames        = frames[:n]
+    frame_ids     = frame_ids[:n]
+    times         = times[:n]
+    shaft_angles  = shaft_angles[:n]
+    shaft_centers = shaft_centers[:n]
+    features      = {k: v[:n] for k, v in features.items() if hasattr(v, '__len__')}
 
-    def _horiz_score(i: int) -> float:
-        ang = shaft_angles_interp[i]
-        if not np.isfinite(ang):
-            return float(features["forearm_horiz"][i])
-        return min(ang, 180.0 - ang)
+    body_scale = _estimate_body_scale(features)
+    sig = _compute_signals(shaft_angles, shaft_centers, features, n, body_scale)
 
-    def _horiz_score_from_angle(ang: float) -> float:
-        return min(ang, 180.0 - ang)
+    shaft_angle = sig['shaft_angle']      # [0°,90°]
+    sa_raw      = sig['shaft_angle_raw']
+    dir_up      = sig['dir_up']
+    dir_dn      = sig['dir_dn']
+    grip_dy     = sig['grip_dy']
+    grip_xy     = sig['grip_xy']
+    hip_xy      = sig['hip_xy']
+    chest_xy    = sig['chest_xy']
+    shoulder_xy = sig['shoulder_xy']
+    hip_angle   = sig['hip_angle']
 
-    def _speed(coords: List[Optional[Tuple[float, float]]]) -> List[float]:
-        speeds = [0.0] * n
-        prev = None
-        for i in range(n):
-            cur = coords[i]
-            if cur is None:
-                cur = prev
-            if prev is None or cur is None:
-                speeds[i] = speeds[i - 1] if i > 0 else 0.0
-            else:
-                speeds[i] = float(np.linalg.norm(np.array(cur) - np.array(prev)))
-            prev = cur
-        return speeds
+    # Derived: distance from horizontal / vertical — use RAW angle for phase detection
+    # (smoothing can suppress true peaks/troughs; raw values reflect actual shaft position)
+    horiz_sc = np.where(np.isfinite(sa_raw), sa_raw,        np.inf)
+    vert_sc  = np.where(np.isfinite(sa_raw), 90.0 - sa_raw, np.inf)
 
-    club_speed = _speed(club_centers)
-    wrist_coords = []
+    # Grip speed — derived from grip_xy, used only for P1
+    grip_spd = np.zeros(n, dtype=float)
+    for i in range(1, n):
+        grip_spd[i] = float(np.linalg.norm(grip_xy[i] - grip_xy[i - 1]))
+    grip_spd = _smooth(grip_spd, w=5)
+
+    # Two-hand grip filter: ||mid_wrist - grip_xy|| nhỏ → cả 2 tay trên gậy
+    _lw = features['left_wrist']
+    _rw = features['right_wrist']
+    mid_wrist_dist = np.full(n, np.inf)
     for i in range(n):
-        w = features["wrist"][i]
-        if np.any(np.isnan(w)):
-            wrist_coords.append(None)
-        else:
-            wrist_coords.append((float(w[0]), float(w[1])))
-    wrist_speed = _speed(wrist_coords)
-    speed = [0.7 * cs + 0.3 * ws for cs, ws in zip(club_speed, wrist_speed)]
+        if np.isfinite(_lw[i]).all() and np.isfinite(_rw[i]).all():
+            mid = (_lw[i] + _rw[i]) / 2.0
+            mid_wrist_dist[i] = float(np.linalg.norm(mid - grip_xy[i]))
 
-    first_window = max(1, n // 5)
-    speed_thr = np.quantile(speed[:first_window], 0.3)
-    p1 = 0
-    for i in range(first_window):
-        if speed[i] <= speed_thr:
-            p1 = i
+    # ===== P1: Address — last stable frame before swing starts =====
+    s_end  = max(3, min(n - 1, int(n * 0.35)))
+    grip_y = grip_xy[:, 1]
+    base_y = np.nanmedian(grip_y[:max(3, s_end // 5)])
+    disp   = np.abs(grip_y - base_y)
+    spd_thr = float(np.nanpercentile(grip_spd[:s_end + 1], 70)) \
+              if np.isfinite(grip_spd[:s_end + 1]).any() else 0.0
+    onset = s_end
+    for i in range(1, s_end + 1):
+        fast = sum(1 for j in range(i, min(s_end + 1, i + 3)) if grip_spd[j] >= spd_thr)
+        if fast >= 2 and disp[i] >= max(5.0, 0.05 * body_scale):
+            onset = i
             break
+    p1_cost = (0.6 * _normalize_cost(disp.tolist()) +
+               0.4 * _normalize_cost(grip_spd.tolist()))
+    p1 = _argmin_range(p1_cost, 0, max(1, onset))
 
-    def _pick_min(start: int, end: int, values: List[float]) -> int:
-        if end <= start:
-            return start
-        segment = values[start:end]
-        return int(start + np.argmin(segment))
+    # Refine P1: ưu tiên frame có cả 2 tay cầm gậy (mid_wrist gần grip)
+    _TH_TWO_HAND = 0.12 * body_scale
+    _two_hand_idxs = [i for i in range(min(onset + 1, n))
+                      if mid_wrist_dist[i] <= _TH_TWO_HAND]
+    if _two_hand_idxs:
+        p1 = int(_two_hand_idxs[int(np.argmin(p1_cost[_two_hand_idxs]))])
 
-    def _pick_max(start: int, end: int, values: List[float]) -> int:
-        if end <= start:
-            return start
-        segment = values[start:end]
-        return int(start + np.argmax(segment))
+    # Duyệt toàn bộ tín hiệu một lần, tìm tất cả đỉnh/đáy theo thứ tự
+    _THR = 15.0
+    sa_extrema = _find_extrema(sa_raw, min_delta=_THR)
 
-    wrist_y = []
+    # ===== P2: Mid-backswing — đáy đầu tiên của sa_raw sau P1 =====
+    p2 = max(_next_extremum(sa_extrema, p1, 'trough', p1 + 1), p1 + 1)
+
+    # ===== P3: Late-backswing — đỉnh đầu tiên của sa_raw sau P2 =====
+    p3 = max(_next_extremum(sa_extrema, p2, 'peak', p2 + 1), p2 + 1)
+
+    # ===== P4: Top-backswing — đáy đầu tiên của grip_y sau P3 =====
+    # grip_y dùng pixel nên dùng riêng (không phải độ)
+    _Y_THR = max(15.0, 0.05 * body_scale)
+    gy_extrema = _find_extrema(grip_y, min_delta=_Y_THR)
+    p4 = max(_next_extremum(gy_extrema, p3, 'trough', p3 + 1), p3 + 1)
+
+    # ===== Lead shoulder (cho P5) =====
+    lead_is_right = bool(features.get('lead_is_right', np.array([True]))[0])
+    _ls_raw = features['right_shoulder'] if lead_is_right else features['left_shoulder']
+    lead_shoulder_xy = np.column_stack([
+        _smooth(_fill(_ls_raw[:, 0]), w=5),
+        _smooth(_fill(_ls_raw[:, 1]), w=5),
+    ])
+
+    # Lead-grip angle per frame [0°=horizontal, 90°=vertical]
+    lead_grip_angle = np.full(n, np.nan)
     for i in range(n):
-        lw = features["left_wrist"][i]
-        rw = features["right_wrist"][i]
-        if np.any(np.isnan(lw)) or np.any(np.isnan(rw)):
-            if np.any(np.isnan(features["wrist"][i])):
-                wrist_y.append(float("inf"))
-            else:
-                wrist_y.append(float(features["wrist"][i][1]))
-        else:
-            wrist_y.append((float(lw[1]) + float(rw[1])) / 2.0)
+        ls = lead_shoulder_xy[i]
+        gp = grip_xy[i]
+        if np.isfinite(ls).all() and np.isfinite(gp).all():
+            dx = abs(gp[0] - ls[0])
+            dy = abs(gp[1] - ls[1])
+            lead_grip_angle[i] = math.degrees(math.atan2(dy, dx + 1e-6))
 
-    coarse_top = _pick_min(p1 + 1, max(p1 + 2, n // 2), wrist_y)
+    lg_extrema = _find_extrema(lead_grip_angle, min_delta=_THR)
 
-    horiz_scores = [_horiz_score(i) for i in range(n)]
-    p2 = _pick_min(p1 + 1, coarse_top, horiz_scores)
+    # ===== P5: Early-downswing — đáy đầu tiên của lead_grip_angle sau P4 =====
+    p5 = max(_next_extremum(lg_extrema, p4, 'trough', p4 + 1), p4 + 1)
 
-    vert_scores = []
-    for i in range(n):
-        ang = shaft_angles_interp[i]
-        if not np.isfinite(ang):
-            vert_scores.append(float("inf"))
-        else:
-            vert_scores.append(abs(ang - 90.0))
-    p3 = _pick_min(p2 + 1, coarse_top, vert_scores)
+    # ===== P6: Mid-downswing — đáy đầu tiên của sa_raw sau đỉnh đầu tiên sau P5 =====
+    # Sau P5, gậy tăng lên đỉnh (đỉnh này nằm trước P6), rồi mới giảm xuống nằm ngang (P6).
+    # Vì vậy cần bỏ qua đỉnh đầu tiên sau P5, rồi lấy đáy tiếp theo.
+    _p6_peak = _next_extremum(sa_extrema, p5, 'peak', p5)
+    p6 = max(_next_extremum(sa_extrema, _p6_peak, 'trough', _p6_peak + 1), p5 + 1)
 
-    top_start = min(n - 2, p3 + 1)
-    top_end = max(top_start + 1, n // 2)
-    p4 = _pick_min(top_start, top_end, wrist_y)
+    # ===== P7: Ball-impact — đỉnh đầu tiên của sa_raw sau P6 =====
+    p7 = max(_next_extremum(sa_extrema, p6, 'peak', p6 + 1), p6 + 1)
 
-    club_x = []
-    club_y = []
-    for i in range(n):
-        c = club_centers[i]
-        if c is None:
-            club_x.append(np.nan)
-            club_y.append(np.nan)
-        else:
-            club_x.append(c[0])
-            club_y.append(c[1])
-    if not np.all(np.isnan(club_x)):
-        window = max(2, n // 20)
-        start = max(top_start, p4 - window)
-        end = min(top_end, p4 + window)
-        vx = np.diff(club_x)
-        sign = np.sign(vx)
-        cand = None
-        for i in range(start, end):
-            if i <= 0 or i >= len(sign):
-                continue
-            if sign[i - 1] == 0 or sign[i] == 0:
-                continue
-            if sign[i - 1] != sign[i]:
-                cand = i
-                break
-        if cand is not None:
-            p4 = cand
-    elif not np.all(np.isnan(club_y)):
-        p4 = int(np.nanargmin(club_y))
-    if p4 <= p1:
-        p4 = min(n - 1, p1 + n // 4)
+    # ===== P8: Mid-followthrough — đáy đầu tiên của sa_raw sau P7 =====
+    p8 = max(_next_extremum(sa_extrema, p7, 'trough', p7 + 1), p7 + 1)
 
-    wrist_hip = [
-        abs(float(features["wrist"][i][1]) - float(features["hip_y"][i]))
-        if not np.any(np.isnan(features["wrist"][i])) and not np.isnan(features["hip_y"][i])
-        else float("inf")
-        for i in range(n)
-    ]
-
-    address_club = club_centers[p1]
-    address_wrist = features["wrist"][p1]
-    if np.any(np.isnan(address_wrist)):
-        address_wrist = None
-    ankle_mid = features["ankle_mid"]
-    left_ankle = features["left_ankle"]
-    right_ankle = features["right_ankle"]
-    ankle_target = None
-    if not np.all(np.isnan(ankle_mid)):
-        ankle_target = np.nanmedian(ankle_mid, axis=0)
-
-    def _ankle_band(i: int) -> Optional[Tuple[float, float]]:
-        la = left_ankle[i]
-        ra = right_ankle[i]
-        if np.any(np.isnan(la)) or np.any(np.isnan(ra)):
-            return None
-        xmin = float(min(la[0], ra[0]))
-        xmax = float(max(la[0], ra[0]))
-        stance = max(1.0, xmax - xmin)
-        pad = 0.12 * stance
-        return xmin - pad, xmax + pad
-
-    def _between_ankle_penalty(i: int, point: np.ndarray) -> float:
-        band = _ankle_band(i)
-        if band is None:
-            return 0.0
-        xmin, xmax = band
-        x = float(point[0])
-        if x < xmin:
-            return 220.0 + (xmin - x) * 4.0
-        if x > xmax:
-            return 220.0 + (x - xmax) * 4.0
-        return 0.0
-
-    def _wrists_in_ankle_band(i: int) -> bool:
-        band = _ankle_band(i)
-        if band is None:
-            return True
-        lw = features["left_wrist"][i]
-        rw = features["right_wrist"][i]
-        if np.any(np.isnan(lw)) or np.any(np.isnan(rw)):
-            return False
-        xmin, xmax = band
-        lx = float(lw[0])
-        rx = float(rw[0])
-        return xmin <= lx <= xmax and xmin <= rx <= xmax
-
-    def _wrists_in_impact_zone(i: int) -> bool:
-        if not _wrists_in_ankle_band(i):
-            return False
-
-        lw = features["left_wrist"][i]
-        rw = features["right_wrist"][i]
-        if np.any(np.isnan(lw)) or np.any(np.isnan(rw)):
-            return False
-
-        ls = features["left_shoulder"][i]
-        rs = features["right_shoulder"][i]
-        y_top = None
-        shoulder_ys = []
-        if not np.any(np.isnan(ls)):
-            shoulder_ys.append(float(ls[1]))
-        if not np.any(np.isnan(rs)):
-            shoulder_ys.append(float(rs[1]))
-        if shoulder_ys:
-            y_top = min(shoulder_ys)
-
-        la = left_ankle[i]
-        ra = right_ankle[i]
-        y_bottom = None
-        ankle_ys = []
-        if not np.any(np.isnan(la)):
-            ankle_ys.append(float(la[1]))
-        if not np.any(np.isnan(ra)):
-            ankle_ys.append(float(ra[1]))
-        if ankle_ys:
-            y_bottom = max(ankle_ys)
-        elif ankle_target is not None:
-            y_bottom = float(ankle_target[1])
-
-        if y_top is None or y_bottom is None or y_bottom <= y_top:
-            return True
-
-        margin = 0.08 * (y_bottom - y_top)
-        for wy in (float(lw[1]), float(rw[1])):
-            if wy < y_top - margin or wy > y_bottom + margin:
-                return False
-        return True
-
-    def _impact_score(i: int) -> float:
-        c = club_centers[i]
-        if c is not None:
-            score = 0.0
-            if address_club is not None:
-                score += float(np.linalg.norm(np.array(c) - np.array(address_club)))
-            am = ankle_mid[i]
-            if not np.any(np.isnan(am)):
-                score += 1.8 * float(np.linalg.norm(np.array(c) - np.array(am)))
-            elif ankle_target is not None:
-                score += 1.8 * float(np.linalg.norm(np.array(c) - np.array(ankle_target)))
-            score += _between_ankle_penalty(i, np.array(c))
-            if address_club is None and ankle_target is None:
-                return float("inf")
-            return score
-
-        lw = features["left_wrist"][i]
-        rw = features["right_wrist"][i]
-        if np.any(np.isnan(lw)) or np.any(np.isnan(rw)):
-            return float("inf")
-        proxy = (lw + rw) / 2.0
-        if np.any(np.isnan(proxy)):
-            return float("inf")
-        score = 0.0
-        has_term = False
-        if address_wrist is not None:
-            score += float(np.linalg.norm(np.array(proxy) - np.array(address_wrist)))
-            has_term = True
-        am = ankle_mid[i]
-        if not np.any(np.isnan(am)):
-            score += 2.0 * float(np.linalg.norm(np.array(proxy) - np.array(am)))
-            has_term = True
-        elif ankle_target is not None:
-            score += 2.0 * float(np.linalg.norm(np.array(proxy) - np.array(ankle_target)))
-            has_term = True
-        score += _between_ankle_penalty(i, np.array(proxy))
-        if not _wrists_in_impact_zone(i):
-            score += 1200.0
-        if has_term:
-            return score + 900.0
-        return float("inf")
-
-    impact_scores = [_impact_score(i) for i in range(n)]
-    p7 = _pick_min(p4 + 1, n - 1, impact_scores)
-    if p7 <= p4:
-        p7 = min(n - 1, p4 + n // 4)
-
-    lead_arm_scores = list(features["lead_arm_horiz"])
-    p5 = _pick_min(p4 + 1, p7, lead_arm_scores)
-
-    p6_start = min(n - 1, p5 + 1)
-    p6_end = max(p6_start + 1, p7)
-    p6_end = min(n, p6_end)
-    p6_raw_horiz_scores = [float("inf")] * n
-    for i in range(p6_start, p6_end):
-        ang = shaft_angles_interp[i]
-        if np.isfinite(ang):
-            p6_raw_horiz_scores[i] = _horiz_score_from_angle(float(ang))
-
-    p6_parallel_thr = 10.0
-    p6 = None
-    for i in range(p6_start, p6_end):
-        if p6_raw_horiz_scores[i] <= p6_parallel_thr:
-            p6 = i
-            break
-    if p6 is None:
-        if np.isfinite(min(p6_raw_horiz_scores[p6_start:p6_end])):
-            p6 = _pick_min(p6_start, p6_end, p6_raw_horiz_scores)
-        else:
-            p6 = _pick_min(p6_start, p6_end, horiz_scores)
-
-    p7_start = max(p6 + 1, p4 + 1)
-    p7_window = max(3, n // 20)
-    p7_stop = min(n, p7_start + p7_window)
-    if p7_stop <= p7_start:
-        p7_stop = min(n, p7_start + 1)
-    p7 = _pick_min(p7_start, p7_stop, impact_scores)
-    if np.isfinite(impact_scores[p7]):
-        p7_best = float(impact_scores[p7])
-        p7_tol = max(8.0, 0.06 * p7_best)
-        for i in range(p7_start, p7_stop):
-            if np.isfinite(impact_scores[i]) and impact_scores[i] <= p7_best + p7_tol:
-                p7 = i
-                break
-    if p7 <= p6:
-        p7 = min(n - 1, p6 + 1)
-
-    horiz_scores = [_horiz_score(i) for i in range(n)]
-
-    p8_window = int(max(5, min(24, round(0.14 * fps))))
-    p8_start = min(n - 1, p7 + 1)
-    p8_end = min(n - 1, p7 + p8_window)
-    if p8_end < p8_start:
-        p8_end = p8_start
-    grip_angles = []
-    grip_horiz_scores = []
-    grip_mid = []
-    grip_dist = []
-    for i in range(n):
-        lw = features["left_wrist"][i]
-        rw = features["right_wrist"][i]
-        if np.any(np.isnan(lw)) or np.any(np.isnan(rw)):
-            grip_angles.append(float("nan"))
-            grip_horiz_scores.append(float("inf"))
-            grip_mid.append(None)
-            grip_dist.append(float("nan"))
-        else:
-            v = rw - lw
-            ang = math.degrees(math.atan2(v[1], v[0]))
-            ang = abs(ang) % 180.0
-            grip_angles.append(ang)
-            grip_horiz_scores.append(_horiz_score_from_angle(ang))
-            mid = (float((lw[0] + rw[0]) / 2.0), float((lw[1] + rw[1]) / 2.0))
-            grip_mid.append(mid)
-            grip_dist.append(float(np.linalg.norm(v)))
-
-    def _shaft_is_reliable(i: int) -> bool:
-        if shaft_centers[i] is None or grip_mid[i] is None or not np.isfinite(grip_dist[i]):
-            return False
-        d = float(np.linalg.norm(np.array(shaft_centers[i]) - np.array(grip_mid[i])))
-        return d <= max(40.0, 2.5 * grip_dist[i])
-
-    shaft_reliable = [_shaft_is_reliable(i) for i in range(n)]
-
-    head_horiz_scores = [float("inf")] * n
-    head_angles = [float("nan")] * n
-    head_dist = [float("nan")] * n
-    for i in range(n):
-        gm = grip_mid[i]
-        hc = club_centers[i]
-        if gm is None or hc is None:
-            continue
-        v = np.array([float(hc[0] - gm[0]), float(hc[1] - gm[1])], dtype=np.float32)
-        d = float(np.linalg.norm(v))
-        head_dist[i] = d
-        if d < 1e-6:
-            continue
-        ang = float(abs(math.degrees(math.atan2(float(v[1]), float(v[0])))) % 180.0)
-        head_angles[i] = ang
-        head_horiz_scores[i] = _horiz_score_from_angle(ang)
-
-    def _angle_diff(a: float, b: float) -> float:
-        d = abs(a - b) % 180.0
-        return min(d, 180.0 - d)
-
-    def _head_is_reliable(i: int) -> bool:
-        if grip_mid[i] is None or club_centers[i] is None:
-            return False
-        if not np.isfinite(head_dist[i]) or not np.isfinite(head_angles[i]):
-            return False
-        gw = float(grip_dist[i]) if np.isfinite(grip_dist[i]) else float("nan")
-        d = float(head_dist[i])
-        if np.isfinite(gw):
-            min_d = max(14.0, 0.65 * gw)
-            max_d = max(120.0, 14.0 * gw)
-        else:
-            min_d = 14.0
-            max_d = 520.0
-        if d < min_d or d > max_d:
-            return False
-        if shaft_reliable[i] and np.isfinite(shaft_angles_interp[i]):
-            if _angle_diff(float(head_angles[i]), float(shaft_angles_interp[i])) > 70.0:
-                return False
-        return True
-
-    head_reliable = [_head_is_reliable(i) for i in range(n)]
-
-    p8_scores = [float("inf")] * n
-    p8_high_penalty = [0.0] * n
-    for i in range(p8_start, p8_end + 1):
-        shaft_score = float("inf")
-        if shaft_reliable[i] and np.isfinite(shaft_angles_interp[i]):
-            shaft_score = _horiz_score_from_angle(float(shaft_angles_interp[i]))
-        grip_score = float(grip_horiz_scores[i]) if np.isfinite(grip_horiz_scores[i]) else float("inf")
-        if np.isfinite(shaft_score) and np.isfinite(grip_score):
-            shaft_ang = float(abs(shaft_angles_interp[i]) % 180.0)
-            grip_ang = float(abs(grip_angles[i]) % 180.0) if np.isfinite(grip_angles[i]) else shaft_ang
-            if abs(shaft_ang - grip_ang) > 35.0:
-                p8_scores[i] = grip_score + 1.0
-            else:
-                p8_scores[i] = 0.8 * shaft_score + 0.2 * grip_score
-        elif np.isfinite(shaft_score):
-            p8_scores[i] = shaft_score
-        elif np.isfinite(grip_score):
-            p8_scores[i] = grip_score + 2.0
-        else:
-            p8_scores[i] = float(features["lead_forearm_horiz"][i]) + 5.0
-
-        if head_reliable[i] and np.isfinite(head_horiz_scores[i]):
-            head_score = float(head_horiz_scores[i])
-            if np.isfinite(shaft_score):
-                p8_scores[i] = min(p8_scores[i], 0.75 * head_score + 0.25 * shaft_score)
-            elif np.isfinite(grip_score):
-                p8_scores[i] = min(p8_scores[i], 0.85 * head_score + 0.15 * grip_score)
-            else:
-                p8_scores[i] = min(p8_scores[i], head_score)
-
-        gm = grip_mid[i]
-        hy = features["hip_y"][i]
-        ls = features["left_shoulder"][i]
-        rs = features["right_shoulder"][i]
-        if gm is not None and not np.isnan(hy):
-            shoulder_ys = []
-            if not np.any(np.isnan(ls)):
-                shoulder_ys.append(float(ls[1]))
-            if not np.any(np.isnan(rs)):
-                shoulder_ys.append(float(rs[1]))
-            if shoulder_ys:
-                shy = min(shoulder_ys)
-                torso = max(1.0, float(hy) - shy)
-                y_upper = shy + 0.32 * torso
-                if float(gm[1]) < y_upper:
-                    p8_high_penalty[i] = 8.0 + (y_upper - float(gm[1])) / torso * 20.0
-                    p8_scores[i] += p8_high_penalty[i]
-
-        p8_scores[i] += 0.65 * float(i - p8_start)
-
-    p8 = _pick_min(p8_start, p8_end + 1, p8_scores)
-    p8_head_thr = 14.0
-    p8_head_candidates = [
-        i
-        for i in range(p8_start, p8_end + 1)
-        if head_reliable[i]
-        and np.isfinite(head_horiz_scores[i])
-        and float(head_horiz_scores[i]) <= p8_head_thr
-        and p8_high_penalty[i] <= 14.0
-    ]
-    if p8_head_candidates:
-        p8 = p8_head_candidates[0]
-    p8_shaft_thr = 14.0
-    p8_grip_thr = 12.0
-    p8_candidates = []
-    if not p8_head_candidates:
-        for i in range(p8_start, p8_end + 1):
-            shaft_ok = (
-                shaft_reliable[i]
-                and np.isfinite(shaft_angles_interp[i])
-                and _horiz_score_from_angle(float(shaft_angles_interp[i])) <= p8_shaft_thr
-            )
-            grip_ok = np.isfinite(grip_horiz_scores[i]) and float(grip_horiz_scores[i]) <= p8_grip_thr
-            ok = shaft_ok or (not shaft_reliable[i] and grip_ok)
-            if ok and p8_high_penalty[i] <= 12.0:
-                p8_candidates.append(i)
-        if p8_candidates:
-            p8 = p8_candidates[0]
-        else:
-            p8_loose_candidates = []
-            for i in range(p8_start, p8_end + 1):
-                shaft_ok = (
-                    shaft_reliable[i]
-                    and np.isfinite(shaft_angles_interp[i])
-                    and _horiz_score_from_angle(float(shaft_angles_interp[i])) <= 22.0
-                )
-                grip_ok = np.isfinite(grip_horiz_scores[i]) and float(grip_horiz_scores[i]) <= 18.0
-                if (shaft_ok or grip_ok) and p8_high_penalty[i] <= 18.0:
-                    p8_loose_candidates.append(i)
-            if p8_loose_candidates:
-                p8 = p8_loose_candidates[0]
-            else:
-                finite_idxs = [i for i in range(p8_start, p8_end + 1) if np.isfinite(p8_scores[i])]
-                if finite_idxs:
-                    best = min(float(p8_scores[i]) for i in finite_idxs)
-                    tol = max(1.5, min(8.0, 0.2 * best + 2.0))
-                    near_best = [i for i in finite_idxs if float(p8_scores[i]) <= best + tol]
-                    if near_best:
-                        p8 = near_best[0]
-
-    p9_start = min(n - 1, p8 + 2)
-    p9_window = int(max(10, min(50, round(0.35 * fps))))
-    p9_end = min(n - 1, p8 + p9_window)
-    if p9_end < p9_start:
-        p9_end = p9_start
-    lead_arm_scores = list(features["lead_arm_horiz"])
-    lead_arm_thr = 12.0
-    lead_is_right = bool(features["lead_is_right"][0])
-    lead_shoulder_arr = features["right_shoulder"] if lead_is_right else features["left_shoulder"]
-    lead_wrist_arr = features["right_wrist"] if lead_is_right else features["left_wrist"]
-
-    p9_scores = [float("inf")] * n
-    for i in range(p9_start, p9_end + 1):
-        if shaft_reliable[i] and np.isfinite(shaft_angles_interp[i]):
-            shaft_vert = abs(float(shaft_angles_interp[i]) - 90.0)
-        elif np.isfinite(grip_angles[i]):
-            shaft_vert = abs(float(grip_angles[i]) - 90.0)
-        else:
-            shaft_vert = 30.0
-        p9_scores[i] = 0.7 * float(lead_arm_scores[i]) + 0.3 * float(shaft_vert)
-
-        ls = lead_shoulder_arr[i]
-        lw = lead_wrist_arr[i]
-        if not np.any(np.isnan(ls)) and not np.any(np.isnan(lw)):
-            dy = float(lw[1] - ls[1])
-            if dy > 8.0:
-                p9_scores[i] += min(26.0, (dy - 8.0) * 0.7)
-            elif dy < -30.0:
-                p9_scores[i] += min(10.0, (-30.0 - dy) * 0.25)
-            p9_scores[i] += 0.2 * float(i - p9_start)
-
-    p9 = _pick_min(p9_start, p9_end + 1, p9_scores)
-    p9_good = []
-    for i in range(p9_start, p9_end + 1):
-        ls = lead_shoulder_arr[i]
-        lw = lead_wrist_arr[i]
-        dy_ok = True
-        if not np.any(np.isnan(ls)) and not np.any(np.isnan(lw)):
-            dy = float(lw[1] - ls[1])
-            dy_ok = (-20.0 <= dy <= 10.0)
-
-        if shaft_reliable[i] and np.isfinite(shaft_angles_interp[i]):
-            vert_ok = abs(float(shaft_angles_interp[i]) - 90.0) <= 20.0
-        elif np.isfinite(grip_angles[i]):
-            vert_ok = abs(float(grip_angles[i]) - 90.0) <= 28.0
-        else:
-            vert_ok = True
-
-        if np.isfinite(lead_arm_scores[i]) and lead_arm_scores[i] <= lead_arm_thr and dy_ok and vert_ok:
-            p9_good.append(i)
-    if p9_good:
-        p9 = min(p9_end, p9_good[0] + 1)
+    # ===== P9: Late-followthrough — đỉnh đầu tiên của sa_raw sau P8 =====
+    p9 = max(_next_extremum(sa_extrema, p8, 'peak', p8 + 1), p8 + 1)
 
     idxs = [p1, p2, p3, p4, p5, p6, p7, p8, p9]
-    default_gap = max(1, n // 25)
-    gaps = [
-        default_gap,
-        default_gap,
-        default_gap,
-        default_gap,
-        1,
-        1,
-        1,
-        1,
-    ]
-    for i in range(1, len(idxs)):
-        min_gap = gaps[i - 1]
-        if idxs[i] <= idxs[i - 1] + min_gap:
-            idxs[i] = min(n - 1, idxs[i - 1] + min_gap)
 
-    names = [
-        "Address",
-        "Mid-backswing",
-        "Late-backswing",
-        "Top-backswing",
-        "Early-downswing",
-        "Mid-downswing",
-        "Ball-impact",
-        "Mid-followthrough",
-        "Late-followthrough",
-    ]
+    # ===== Debug CSV =====
+    if debug:
+        def _xy(arr, i):
+            x, y = arr[i]
+            if np.isfinite(x) and np.isfinite(y):
+                return f"{x:.1f}", f"{y:.1f}"
+            return '', ''
+
+        try:
+            import os as _os
+            _os.makedirs(_os.path.dirname(_os.path.abspath(debug_path)), exist_ok=True)
+            with open(debug_path, 'w', encoding='utf-8') as f:
+                f.write('frame_id,'
+                        'shaft_angle_raw,shaft_angle,'
+                        'direction,'
+                        'hip_x,hip_y,'
+                        'chest_x,chest_y,'
+                        'shoulder_x,shoulder_y,'
+                        'grip_x,grip_y,'
+                        'lead_grip_angle,'
+                        'phase\n')
+                phase_at = {idxs[k]: f"P{k+1}-{PHASE_NAMES[k]}" for k in range(len(idxs))}
+                for i in range(n):
+                    d   = 'UP' if dir_up[i] else ('DOWN' if dir_dn[i] else '-')
+                    ph  = phase_at.get(i, '')
+                    raw = f"{sa_raw[i]:.1f}" if np.isfinite(sa_raw[i]) else ''
+                    sa  = f"{shaft_angle[i]:.1f}" if np.isfinite(shaft_angle[i]) else ''
+                    hx, hy = _xy(hip_xy,      i)
+                    cx, cy = _xy(chest_xy,    i)
+                    sx, sy = _xy(shoulder_xy, i)
+                    gx, gy = _xy(grip_xy,     i)
+                    lg = f"{lead_grip_angle[i]:.1f}" if np.isfinite(lead_grip_angle[i]) else ''
+                    f.write(f"{frame_ids[i]},{raw},{sa},{d},{hx},{hy},{cx},{cy},{sx},{sy},{gx},{gy},{lg},{ph}\n")
+        except Exception as e:
+            print(f"[WARN] phase debug write failed: {e}")
+
     events = []
-    for name, idx in zip(names, idxs):
-        events.append({"name": name, "frame": int(frame_ids[idx]), "t": float(times[idx])})
-    return events
+    for k, idx in enumerate(idxs):
+        idx = int(max(0, min(int(idx), n - 1)))
+        events.append({'name': PHASE_NAMES[k], 'frame': int(frame_ids[idx]), 't': float(times[idx])})
+
+    body_signals = {
+        'hip_xy':      hip_xy,
+        'chest_xy':    chest_xy,
+        'shoulder_xy': shoulder_xy,
+        'grip_xy':     grip_xy,
+        'hip_angle':   hip_angle,
+    }
+    return events, body_signals
+
+
+# Alias for backward compatibility with pipeline.py import
+detect_events_rule9 = detect_swing_phases

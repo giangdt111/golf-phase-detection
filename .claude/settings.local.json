@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/home/savvycom/anaconda3/envs/golf_swing/bin/pip install:*)",
+      "Bash(/home/savvycom/anaconda3/envs/golf_swing/bin/python app.py)",
+      "Bash(python -c \":*)"
+    ]
+  }
+}

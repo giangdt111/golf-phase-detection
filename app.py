@@ -9,7 +9,7 @@ import os
 
 from golf_swing.pipeline import SwingInferenceService
 from golf_swing.segmentation import init_seg_model
-from golf_swing.overlay import render_overlay, write_phase_frames
+from golf_swing.overlay import render_overlay
 
 
 def _load_env_file(path: str = ".env") -> None:
@@ -85,12 +85,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("MAX_FRAMES", "0")) or None,
         help="Max frames to run (env: MAX_FRAMES). 0 means no limit.",
-    )
-    parser.add_argument(
-        "--event-mode",
-        default=os.getenv("EVENT_MODE", "rule9"),
-        choices=["rule", "rule9"],
-        help="How to detect swing events.",
     )
     parser.add_argument("--out", default=None, help="Output JSON path.")
     parser.add_argument("--overlay-out", default=None, help="Output overlay video path.")
@@ -188,10 +182,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     _load_env_file()
     args = parse_args()
+    args.video = os.path.abspath(args.video)
     # Optional hard-coded override (set to a path string to force a specific video).
     input_video_path = None
     if input_video_path is not None:
-        args.video = input_video_path
+        args.video = os.path.abspath(input_video_path)
     # Auto-pick GPU if available and user did not force a device.
     if args.device is None:
         try:
@@ -230,16 +225,17 @@ def main() -> None:
         raise SystemExit(f"Video not found: {args.video}")
 
     video_base = os.path.splitext(os.path.basename(args.video))[0]
-    output_root = os.getenv("OUTPUT_ROOT", "output")
+    output_root = os.path.abspath(os.getenv("OUTPUT_ROOT", "output"))
     output_dir = os.path.join(output_root, video_base)
     os.makedirs(output_dir, exist_ok=True)
     if args.out is None:
         args.out = os.path.join(output_dir, "swing_result.json")
+    else:
+        args.out = os.path.abspath(args.out)
     if args.overlay_out is None:
         args.overlay_out = os.path.join(output_dir, "swing_overlay.mp4")
-    if args.phase_frames_out is None:
-        args.phase_frames_out = os.path.join(output_dir, "phase_frames")
-
+    else:
+        args.overlay_out = os.path.abspath(args.overlay_out)
     service = SwingInferenceService()
     seg_model_path = None if args.seg_disable else args.seg_model
 
@@ -252,7 +248,6 @@ def main() -> None:
         device=args.device,
         stride=args.stride,
         max_frames=args.max_frames,
-        event_mode=args.event_mode,
         swing_direction=args.swing_direction,
         seg_model_path=seg_model_path,
         seg_imgsz=args.seg_imgsz,
@@ -264,22 +259,26 @@ def main() -> None:
         person_det_iou=args.person_det_iou,
         person_det_imgsz=args.person_det_imgsz,
         force_yolo_person=args.force_yolo_person,
+        # Enable debug P9 by env flag
+        debug_p9=True,
+        debug_p9_path=os.path.join(output_dir, "phase_debug.csv"),
     )
 
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
     print(f"Wrote {args.out}")
 
     seg_model = None if args.seg_disable else init_seg_model(args.seg_model)
-    events_for_render = result.get("events")
+    render_video_path = os.path.abspath(result.get("video", {}).get("path", args.video))
     slow_out = os.path.splitext(args.overlay_out)[0] + "_slow4x.mp4"
+    phase_frames_dir = os.path.join(output_dir, "phase_frames")
     render_overlay(
-        args.video,
+        render_video_path,
         args.out,
         slow_out,
         args.overlay_score_thr,
         slow_factor=4,
-        events_override=events_for_render,
         seg_model=seg_model,
         seg_imgsz=args.seg_imgsz,
         seg_conf=args.seg_conf,
@@ -294,27 +293,10 @@ def main() -> None:
         person_det_conf=args.person_det_conf,
         person_det_iou=args.person_det_iou,
         person_det_imgsz=args.person_det_imgsz,
+        phase_frames_out=phase_frames_dir,
     )
     print(f"Wrote {slow_out}")
-
-    frame_map = {int(item["frame"]): item.get("keypoints") for item in result.get("frames", [])}
-    edges = result.get("skeleton", {}).get("edges")
-    write_phase_frames(
-        args.video,
-        events_for_render or [],
-        args.phase_frames_out,
-        frame_map=frame_map,
-        edges=edges,
-        score_thr=args.overlay_score_thr,
-        seg_model=seg_model,
-        seg_imgsz=args.seg_imgsz,
-        seg_conf=args.seg_conf,
-        seg_iou=args.seg_iou,
-        seg_device=args.seg_device,
-        seg_classes=[0, 1],
-        seg_alpha=args.seg_alpha,
-    )
-    print(f"Wrote phase frames to {args.phase_frames_out}")
+    print(f"Phase frames saved to {phase_frames_dir}")
 
 
 if __name__ == "__main__":

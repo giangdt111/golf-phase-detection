@@ -1,0 +1,12 @@
+P1 => Frame trước khi chuyển động bắt đầu — club gần baseline (median vị trí đầu)
+P2 => Shaft lần đầu nằm ngang sau P1, khi gậy đang UP, và góc càng gần 0 càng tốt
+P3 => sau P2, gậy lần đầu vuông góc (góc càng gần 90 so với phương ngang càng tốt), và đang UP
+P4 => đổI thành điểm Grip cao nhất
+P5 => Đường thẳng nối 2 điểm (gồm điểm vai của tay trước và điểm grip) có phương ngang, gậy đang DOWN
+P6 => Gậy đang DOWN, nằm ngang lần đầu sau P5
+P7 => sau P6, gậy thẳng đứng, góc càng gần 90 độ càng tốt (vị trí gần address nhất)
+P8 => sau P7, gậy đang UP, nằm ngang, góc càng gần 0 độ càng tốt
+P9 => Sau P8, gậy đang UP, gậy vuông mặt đất, góc càng gần 90 độ càng tốt
+
+
+scp -r savvycom@10.22.4.182:/home/savvycom/AI_team/giangdt/ai_golf_swing .

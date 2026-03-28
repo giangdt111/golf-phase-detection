@@ -1,0 +1,24 @@
+# Runtime requirements for this repo on Ubuntu GPU.
+#
+# Install order matters for OpenMMLab packages. The recommended flow is:
+#   1) Install PyTorch first
+#   2) Install openmim
+#   3) Install mmengine/mmcv/mmdet with `python -m mim`
+#   4) Install this requirements file
+#
+# This repo uses the vendored source in ./mmpose-main, so `mmpose` is not
+# installed from PyPI.
+#
+# `mmdet` remains optional at runtime when using `--force-yolo-person`, but is
+# still part of the recommended OpenMMLab setup for compatibility.
+
+ultralytics>=8.1.0
+numpy
+opencv-python
+pillow
+scipy
+matplotlib
+json_tricks
+munkres
+xtcocotools>=1.12
+rich
