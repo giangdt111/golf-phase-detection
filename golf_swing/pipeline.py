@@ -224,6 +224,7 @@ class SwingInferenceService:
         device: Optional[str],
         stride: int,
         max_frames: Optional[int],
+        height_mm: Optional[float],
         swing_direction: Optional[str],
         seg_model_path: Optional[str],
         seg_imgsz: int,
@@ -581,6 +582,73 @@ class SwingInferenceService:
         p1_frame_id = next((e['frame'] for e in events if e['name'] == 'Address'), None)
         p1_idx = frame_id_to_idx.get(p1_frame_id)
 
+        def _midpoint(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            if a is None or b is None:
+                return None
+            return (a + b) / 2.0
+
+        def _segment_length(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+            if a is None or b is None:
+                return None
+            return float(np.linalg.norm(a - b))
+
+        def _mean_valid(values: List[Optional[float]]) -> Optional[float]:
+            finite = [float(v) for v in values if v is not None and np.isfinite(v)]
+            if not finite:
+                return None
+            return float(sum(finite) / len(finite))
+
+        def _estimate_height_scale(
+            keypoints: Optional[List[Dict[str, float]]],
+            player_height_mm: Optional[float],
+        ) -> Optional[Dict[str, float]]:
+            if player_height_mm is None or player_height_mm <= 0 or not keypoints:
+                return None
+
+            shoulder_mid = _midpoint(safe_point(keypoints, 5), safe_point(keypoints, 6))
+            hip_mid = _midpoint(safe_point(keypoints, 11), safe_point(keypoints, 12))
+            torso_len = _segment_length(shoulder_mid, hip_mid)
+            left_leg = _mean_valid([
+                _segment_length(safe_point(keypoints, 11), safe_point(keypoints, 13)),
+                _segment_length(safe_point(keypoints, 13), safe_point(keypoints, 15)),
+            ])
+            right_leg = _mean_valid([
+                _segment_length(safe_point(keypoints, 12), safe_point(keypoints, 14)),
+                _segment_length(safe_point(keypoints, 14), safe_point(keypoints, 16)),
+            ])
+            leg_len = _mean_valid([left_leg, right_leg])
+
+            head_anchor_dist = _mean_valid([
+                _segment_length(safe_point(keypoints, idx), shoulder_mid) for idx in (0, 1, 2, 3, 4)
+            ])
+            if head_anchor_dist is not None:
+                head_len = head_anchor_dist * 1.18
+            elif torso_len is not None:
+                head_len = torso_len * 0.42
+            else:
+                head_len = None
+
+            if torso_len is None or leg_len is None or head_len is None:
+                return None
+
+            height_proxy_px = torso_len + leg_len + head_len
+            if not np.isfinite(height_proxy_px) or height_proxy_px <= 1e-6:
+                return None
+
+            return {
+                "height_mm": float(player_height_mm),
+                "height_proxy_px": round(float(height_proxy_px), 2),
+                "mm_per_px": round(float(player_height_mm / height_proxy_px), 6),
+                "source": "address_pose_height_proxy",
+            }
+
+        scale_info = None
+        mm_per_px = None
+        if p1_idx is not None and 0 <= p1_idx < len(frames):
+            scale_info = _estimate_height_scale(frames[p1_idx].keypoints, height_mm)
+            if scale_info is not None:
+                mm_per_px = float(scale_info["mm_per_px"])
+
         _BP_KEYS = ('hip_xy', 'chest_xy', 'shoulder_xy', 'grip_xy')
         _BP_NAMES = ('hip', 'chest', 'shoulder', 'grip')
 
@@ -605,7 +673,11 @@ class SwingInferenceService:
                 r = ref.get(key)
                 dx = round(float(v[0] - r[0]), 1) if r is not None else None
                 dy = round(float(v[1] - r[1]), 1) if r is not None else None
-                result[name] = {"x": x, "y": y, "dx": dx, "dy": dy}
+                item = {"x": x, "y": y, "dx": dx, "dy": dy}
+                if mm_per_px is not None:
+                    item["dx_mm_est"] = round(dx * mm_per_px, 1) if dx is not None else None
+                    item["dy_mm_est"] = round(dy * mm_per_px, 1) if dy is not None else None
+                result[name] = item
             return result
 
         video_width = float(meta["width"])
@@ -640,6 +712,7 @@ class SwingInferenceService:
                 "frame_count": meta["frame_count"],
                 "stride": stride,
             },
+            "calibration": scale_info,
             "skeleton": {
                 "format": "coco",
                 "keypoint_names": COCO_KEYPOINT_NAMES,
@@ -660,6 +733,7 @@ class SwingInferenceService:
                     "shaft_smooth": shaft_centers_smooth[idx] if idx < len(shaft_centers_smooth) else None,
                     "body_points": _body_points_for_frame(idx),
                     "hip_angle": round(float(body_signals['hip_angle'][idx]), 2) if idx < len(body_signals['hip_angle']) and np.isfinite(body_signals['hip_angle'][idx]) else None,
+                    "chest_angle": round(float(body_signals['chest_angle'][idx]), 2) if idx < len(body_signals['chest_angle']) and np.isfinite(body_signals['chest_angle'][idx]) else None,
                 }
                 for idx, f in enumerate(frames)
             ],

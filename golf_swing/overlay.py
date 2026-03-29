@@ -60,19 +60,22 @@ def _draw_stats_panel(
     body_points: Optional[dict],
     shaft_angle: Optional[float],
     hip_angle: Optional[float],
+    chest_angle: Optional[float],
+    calibration: Optional[dict],
     panel_x: int = 10,
     panel_y: int = 200,
 ) -> None:
-    """Vẽ panel thống kê góc phải frame: dx/dy các điểm + góc shaft + góc hông."""
+    """Vẽ panel thống kê displacement; ưu tiên mm nếu JSON có calibration."""
     FONT       = cv2.FONT_HERSHEY_SIMPLEX
     FS         = 0.55
     THICKNESS  = 1
     LINE_H     = 28
     PAD        = 8
-    COL_W      = 280
+    COL_W      = 330
+    use_mm = calibration is not None and calibration.get("mm_per_px") is not None
 
     # Xây danh sách dòng
-    rows = [("Stats", (255, 255, 255), True)]  # (text, color, is_header)
+    rows = [("Stats (mm est)" if use_mm else "Stats (px)", (255, 255, 255), True)]
     point_cfg = [
         ("Hip",      "hip"),
         ("Chest",    "chest"),
@@ -82,18 +85,22 @@ def _draw_stats_panel(
     for label, key in point_cfg:
         bp = (body_points or {}).get(key)
         if bp is not None:
-            dx = bp.get("dx")
-            dy = bp.get("dy")
+            dx = bp.get("dx_mm_est") if use_mm else bp.get("dx")
+            dy = bp.get("dy_mm_est") if use_mm else bp.get("dy")
             dx_str = f"{dx:+.1f}" if dx is not None else "  --"
             dy_str = f"{dy:+.1f}" if dy is not None else "  --"
-            text = f"{label:<9} dx:{dx_str:>7}  dy:{dy_str:>7}"
+            text = f"{label:<9} dx:{dx_str:>7}  dy:{dy_str:>7} {'mm' if use_mm else 'px'}"
         else:
-            text = f"{label:<9} dx:  --      dy:  --"
+            text = f"{label:<9} dx:  --      dy:  --   {'mm' if use_mm else 'px'}"
         rows.append((text, (220, 220, 220), False))
 
     sa_str  = f"{shaft_angle:.1f} deg" if shaft_angle is not None else "--"
     hip_str = f"{hip_angle:.1f} deg"   if hip_angle  is not None else "--"
+    chest_str = f"{chest_angle:.1f} deg" if chest_angle is not None else "--"
+    if use_mm:
+        rows.append((f"Scale:     {calibration['mm_per_px']:.3f} mm/px", (180, 255, 180), False))
     rows.append((f"Shaft ang: {sa_str}",  (0, 255, 255), False))
+    rows.append((f"Chest ang: {chest_str}", (120, 220, 255), False))
     rows.append((f"Hip ang:   {hip_str}", (255, 200, 80), False))
 
     n_rows   = len(rows)
@@ -243,6 +250,7 @@ def render_overlay(
     json_path = os.path.abspath(json_path)
     output_path = os.path.abspath(output_path)
     data = _load_json(json_path)
+    calibration = data.get("calibration")
     frame_map = {
         int(item["frame"]): {
             "keypoints":          item.get("keypoints"),
@@ -250,6 +258,7 @@ def render_overlay(
             "shaft_smooth":       item.get("shaft_smooth"),
             "body_points":        item.get("body_points"),
             "hip_angle":          item.get("hip_angle"),
+            "chest_angle":        item.get("chest_angle"),
         }
         for item in data.get("frames", [])
     }
@@ -484,10 +493,11 @@ def render_overlay(
         # Stats panel (bottom-left)
         _bp       = frame_data.get("body_points") if frame_data else None
         _hip_ang  = frame_data.get("hip_angle")   if frame_data else None
+        _chest_ang = frame_data.get("chest_angle") if frame_data else None
         _shaft_ang = float(min(live_shaft_angle % 180.0, 180.0 - live_shaft_angle % 180.0)) \
                      if live_shaft_angle is not None else \
                      (stored_shaft_angle if stored_shaft_angle is not None else None)
-        _draw_stats_panel(frame, _bp, _shaft_ang, _hip_ang,
+        _draw_stats_panel(frame, _bp, _shaft_ang, _hip_ang, _chest_ang, calibration,
                           panel_x=10, panel_y=height - 330)
 
         # Frame number (top-right corner)

@@ -256,6 +256,17 @@ def _compute_signals(
             hip_angle[i] = math.degrees(math.atan2(dy, dx))
     hip_angle = _smooth(_fill(hip_angle), w=5)
 
+    # ---- Chest angle: góc nhọn giữa trục shoulder->chest và phương ngang [0°, 90°] ----
+    chest_angle = np.full(n, np.nan)
+    for i in range(n):
+        sho = shoulder_xy[i]
+        che = chest_xy[i]
+        if np.isfinite(sho).all() and np.isfinite(che).all():
+            dx = abs(che[0] - sho[0])
+            dy = abs(che[1] - sho[1])
+            chest_angle[i] = math.degrees(math.atan2(dy, dx))
+    chest_angle = _smooth(_fill(chest_angle), w=5)
+
     return dict(
         shaft_angle=shaft_angle,
         shaft_angle_raw=sa_raw,
@@ -267,6 +278,7 @@ def _compute_signals(
         shoulder_xy=shoulder_xy,
         grip_xy=grip_xy_smooth,
         hip_angle=hip_angle,
+        chest_angle=chest_angle,
     )
 
 
@@ -324,6 +336,7 @@ def detect_swing_phases(
     chest_xy    = sig['chest_xy']
     shoulder_xy = sig['shoulder_xy']
     hip_angle   = sig['hip_angle']
+    chest_angle = sig['chest_angle']
 
     # Derived: distance from horizontal / vertical — use RAW angle for phase detection
     # (smoothing can suppress true peaks/troughs; raw values reflect actual shaft position)
@@ -472,6 +485,7 @@ def detect_swing_phases(
         'shoulder_xy': shoulder_xy,
         'grip_xy':     grip_xy,
         'hip_angle':   hip_angle,
+        'chest_angle': chest_angle,
     }
     return events, body_signals
 
