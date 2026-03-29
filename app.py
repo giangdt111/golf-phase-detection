@@ -37,6 +37,16 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return val.lower() in ("1", "true", "yes", "y", "on")
 
 
+def _env_float(name: str):
+    val = os.getenv(name)
+    if val in (None, ""):
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Infer 2D skeleton keypoints and swing events from a video."
@@ -85,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.getenv("MAX_FRAMES", "0")) or None,
         help="Max frames to run (env: MAX_FRAMES). 0 means no limit.",
+    )
+    parser.add_argument(
+        "--height-mm",
+        type=float,
+        default=_env_float("HEIGHT_MM"),
+        help="Player height in millimeters for approximate pixel-to-mm calibration (env: HEIGHT_MM).",
     )
     parser.add_argument("--out", default=None, help="Output JSON path.")
     parser.add_argument("--overlay-out", default=None, help="Output overlay video path.")
@@ -248,6 +264,7 @@ def main() -> None:
         device=args.device,
         stride=args.stride,
         max_frames=args.max_frames,
+        height_mm=args.height_mm,
         swing_direction=args.swing_direction,
         seg_model_path=seg_model_path,
         seg_imgsz=args.seg_imgsz,

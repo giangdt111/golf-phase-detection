@@ -20,6 +20,7 @@ build/
 
 # Logs / outputs
 *.log
+/output/
 
 # Checkpoints and large models
 model/*.pth
@@ -31,6 +32,10 @@ model/*.pt
 # Local env/config
 .env
 .env.local
+
+# Local video datasets
+/video/
+/video_raw/
 
 
 # Jupyter
