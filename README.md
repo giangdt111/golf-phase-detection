@@ -19,11 +19,12 @@ Key flags:
 - `--seg-disable` to skip club segmentation
 - `--device cuda:0` to force GPU
 - `--force-yolo-person` to bypass MMDetection and use YOLOv8 person detector
+- `--height-mm 1750` to estimate `dx/dy` in millimeters from the Address frame pose
 
 Environment overrides (all have CLI equivalents):
 - DEVICE, SEG_DEVICE, VIDEO_PATH, OUTPUT_ROOT
 - POSE2D_CONFIG / POSE2D_WEIGHTS, DET_MODEL / DET_WEIGHTS, SEG_MODEL, PERSON_DET_MODEL
-- STRIDE, MAX_FRAMES, OVERLAY_SCORE_THR
+- STRIDE, MAX_FRAMES, HEIGHT_MM, OVERLAY_SCORE_THR
 - SEG_IMGSZ, SEG_CONF, SEG_IOU, SEG_ALPHA, SEG_DISABLE, DET_DEBUG
 - PERSON_DET_CONF, PERSON_DET_IOU, PERSON_DET_IMGSZ, FORCE_PERSON_YOLO
 `.env` is auto-loaded on startup (keys are ignored if already present in the process env).
