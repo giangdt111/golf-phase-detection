@@ -159,7 +159,6 @@ class AnalysisQueueService:
             "device": os.getenv("DEVICE"),
             "stride": int(os.getenv("STRIDE", "1")),
             "max_frames": int(os.getenv("MAX_FRAMES", "0")) or None,
-            "event_mode": os.getenv("EVENT_MODE", "rule9"),
             "swing_direction": os.getenv("SWING_DIRECTION"),
             "seg_model_path": None if _env_bool("SEG_DISABLE", False) else os.getenv("SEG_MODEL", "golf_segment/best.pt"),
             "seg_imgsz": int(os.getenv("SEG_IMGSZ", "960")),
@@ -254,42 +253,66 @@ class AnalysisQueueService:
         return phases
 
     @staticmethod
+    def _point_to_dict(point) -> Optional[Dict[str, float]]:
+        """Convert a [x, y] list/tuple to {"x": ..., "y": ...}, or None."""
+        if point is None:
+            return None
+        try:
+            x, y = float(point[0]), float(point[1])
+            return {"x": x, "y": y}
+        except (TypeError, IndexError, ValueError):
+            return None
+
+    @staticmethod
     def _build_segmentation_frames(result: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Build segmentation_frames from pipeline result (per-frame shaft/club data)."""
         frames = result.get("frames") or []
         out: List[Dict[str, Any]] = []
+        to_pt = AnalysisQueueService._point_to_dict
         for frame in frames:
             t = float(frame.get("t", 0.0))
             timestamp_ms = int(round(t * 1000.0))
-            shaft_angle = frame.get("shaft_angle")
-            club_center = frame.get("club_center")
-            shaft_center = frame.get("shaft_center")
             out.append(
                 {
                     "timestamp_ms": timestamp_ms,
-                    "shaft_angle": shaft_angle,
-                    "club_center": club_center,
-                    "shaft_center": shaft_center,
+                    "shaft_angle": frame.get("shaft_angle"),
+                    "shaft_angle_smooth": frame.get("shaft_angle_smooth"),
+                    "club_center": to_pt(frame.get("head_smooth")),
+                    "shaft_center": to_pt(frame.get("shaft_smooth")),
                 }
             )
         return out
 
     @staticmethod
-    def _build_person_bbox_frames(result: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Build person_bbox_frames from pipeline result (per-frame human bbox)."""
+    def _build_body_frames(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Build body_frames from pipeline result (per-frame body_points + hip_angle)."""
         frames = result.get("frames") or []
         out: List[Dict[str, Any]] = []
         for frame in frames:
             t = float(frame.get("t", 0.0))
             timestamp_ms = int(round(t * 1000.0))
-            person_bbox = frame.get("person_bbox")
             out.append(
                 {
                     "timestamp_ms": timestamp_ms,
-                    "person_bbox": person_bbox,
+                    "hip_angle": frame.get("hip_angle"),
+                    "body_points": frame.get("body_points"),
                 }
             )
         return out
+
+    @staticmethod
+    def _build_video_info(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extract video metadata from pipeline result."""
+        video = result.get("video")
+        if not isinstance(video, dict):
+            return None
+        return {
+            "fps": video.get("fps"),
+            "width": video.get("width"),
+            "height": video.get("height"),
+            "frame_count": video.get("frame_count"),
+            "stride": video.get("stride"),
+        }
 
     def _run_inference(self, video_path: str) -> Dict[str, Any]:
         kwargs = self._inference_kwargs()
@@ -326,7 +349,8 @@ class AnalysisQueueService:
                 phases = self._build_phases(result, video_duration_ms)
                 pose_frames = self._build_pose_frames(result)
                 segmentation_frames = self._build_segmentation_frames(result)
-                person_bbox_frames = self._build_person_bbox_frames(result)
+                body_frames = self._build_body_frames(result)
+                video_info = self._build_video_info(result)
 
                 response = {
                     "id": request_id,
@@ -335,7 +359,9 @@ class AnalysisQueueService:
                         "pose_frames": pose_frames,
                         "video_duration_ms": video_duration_ms,
                         "segmentation_frames": segmentation_frames,
-                        "person_bbox_frames": person_bbox_frames,
+                        "body_frames": body_frames,
+                        "swing_direction": result.get("swing_direction"),
+                        "video_info": video_info,
                     },
                 }
                 self._save_output_json(response)

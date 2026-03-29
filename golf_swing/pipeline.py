@@ -189,7 +189,6 @@ class SwingInferenceService:
         device: Optional[str],
         stride: int,
         max_frames: Optional[int],
-        event_mode: str,
         swing_direction: Optional[str],
         seg_model_path: Optional[str],
         seg_imgsz: int,
@@ -271,6 +270,7 @@ class SwingInferenceService:
         head_meas_traj: List[Optional[Tuple[float, float]]] = []
         shaft_meas_traj: List[Optional[Tuple[float, float]]] = []
         shaft_angle_pred_traj: List[Optional[float]] = []
+        person_bboxes: List[Optional[Tuple[int, ...]]] = []
         frame_id = 0
         kept = 0
         last_bbox = None
