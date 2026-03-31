@@ -660,9 +660,7 @@ class SwingInferenceService:
                 ref[key] = v if np.isfinite(v).all() else None
 
         def _body_points_for_frame(arr_idx):
-            """Return body_points dict for one frame (None nếu trước Address)."""
-            if p1_idx is None or arr_idx < p1_idx:
-                return None
+            """Return absolute body points for one frame and relative displacement when available."""
             result = {}
             for key, name in zip(_BP_KEYS, _BP_NAMES):
                 v = body_signals[key][arr_idx]
@@ -671,8 +669,8 @@ class SwingInferenceService:
                     continue
                 x, y = round(float(v[0]), 1), round(float(v[1]), 1)
                 r = ref.get(key)
-                dx = round(float(v[0] - r[0]), 1) if r is not None else None
-                dy = round(float(v[1] - r[1]), 1) if r is not None else None
+                dx = round(float(v[0] - r[0]), 1) if r is not None and p1_idx is not None and arr_idx >= p1_idx else None
+                dy = round(float(v[1] - r[1]), 1) if r is not None and p1_idx is not None and arr_idx >= p1_idx else None
                 item = {"x": x, "y": y, "dx": dx, "dy": dy}
                 if mm_per_px is not None:
                     item["dx_mm_est"] = round(dx * mm_per_px, 1) if dx is not None else None
