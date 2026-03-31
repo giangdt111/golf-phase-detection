@@ -1,4 +1,6 @@
 setuptools>=65.0.0,<82
+# System dependency note: install FFmpeg (`ffprobe`, `ffmpeg`) so the queue can
+# normalize source video orientation before inference.
 torch
 torchvision
 mmengine>=0.4.0,<1.0.0

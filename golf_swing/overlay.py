@@ -328,7 +328,6 @@ def render_overlay(
         ok, frame = cap.read()
         if not ok:
             break
-
         # Draw segmentation mask + shaft line (single YOLO call)
         live_shaft_center: Optional[Tuple[float, float]] = None
         live_shaft_angle: Optional[float] = None

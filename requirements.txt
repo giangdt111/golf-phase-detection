@@ -11,6 +11,9 @@
 #
 # `mmdet` remains optional at runtime when using `--force-yolo-person`, but is
 # still part of the recommended OpenMMLab setup for compatibility.
+#
+# System dependency: `ffprobe` / `ffmpeg` (from FFmpeg) is recommended so the
+# queue service can normalize source video orientation before inference.
 
 ultralytics>=8.1.0
 numpy

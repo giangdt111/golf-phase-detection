@@ -11,17 +11,20 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
+import subprocess
 import tempfile
 import traceback
 import urllib.request
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import aio_pika
 from aiormq.exceptions import ProbableAuthenticationError
 
 from golf_swing.pipeline import SwingInferenceService
+from golf_swing.utils import probe_video_rotation_with_details
 
 
 REQUEST_QUEUE = "request_golf_analysis"
@@ -285,7 +288,7 @@ class AnalysisQueueService:
 
     @staticmethod
     def _build_body_frames(result: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Build body_frames from pipeline result (per-frame body_points + hip_angle)."""
+        """Build body_frames from pipeline result (per-frame body_points + body angles)."""
         frames = result.get("frames") or []
         out: List[Dict[str, Any]] = []
         for frame in frames:
@@ -295,6 +298,7 @@ class AnalysisQueueService:
                 {
                     "timestamp_ms": timestamp_ms,
                     "hip_angle": frame.get("hip_angle"),
+                    "chest_angle": frame.get("chest_angle"),
                     "body_points": frame.get("body_points"),
                 }
             )
@@ -314,9 +318,208 @@ class AnalysisQueueService:
             "stride": video.get("stride"),
         }
 
-    def _run_inference(self, video_path: str) -> Dict[str, Any]:
+    @staticmethod
+    def _parse_height_mm(payload: Dict[str, Any]) -> Optional[float]:
+        """Extract player height in millimeters from payload."""
+        # Accept both snake_case and camelCase keys from different clients.
+        mm_candidates = (
+            "height_mm",
+            "heightMm",
+            "player_height_mm",
+            "playerHeightMm",
+        )
+        cm_candidates = (
+            "height_cm",
+            "heightCm",
+            "player_height_cm",
+            "playerHeightCm",
+        )
+        m_candidates = (
+            "height_m",
+            "heightM",
+            "player_height_m",
+            "playerHeightM",
+        )
+
+        def _to_positive_float(val: Any) -> Optional[float]:
+            if val is None:
+                return None
+            try:
+                n = float(val)
+            except (TypeError, ValueError):
+                return None
+            if n <= 0:
+                return None
+            return n
+
+        for key in mm_candidates:
+            n = _to_positive_float(payload.get(key))
+            if n is not None:
+                return n
+        for key in cm_candidates:
+            n = _to_positive_float(payload.get(key))
+            if n is not None:
+                return n * 10.0
+        for key in m_candidates:
+            n = _to_positive_float(payload.get(key))
+            if n is not None:
+                return n * 1000.0
+        return None
+
+    def _run_inference(self, video_path: str, height_mm: Optional[float]) -> Dict[str, Any]:
         kwargs = self._inference_kwargs()
-        return self._service.run(video_path=video_path, **kwargs)
+        return self._service.run(video_path=video_path, height_mm=height_mm, **kwargs)
+
+    @staticmethod
+    def _rotation_vf(rotation_degrees: int) -> Optional[str]:
+        if rotation_degrees == 90:
+            return "transpose=1"
+        if rotation_degrees == 180:
+            return "hflip,vflip"
+        if rotation_degrees == 270:
+            return "transpose=2"
+        return None
+
+    @staticmethod
+    def _log_rotation_probe(prefix: str, details: Dict[str, Any]) -> None:
+        """Print ffprobe diagnostics for video rotation (container metadata)."""
+        print(f"{prefix} --- rotation probe (ffprobe) ---")
+        cmd = details.get("ffprobe_cmd")
+        if cmd:
+            print(f"{prefix} cmd: {cmd}")
+        if details.get("ffprobe_not_found"):
+            print(
+                f"{prefix} ffprobe not found on PATH — install ffmpeg package; "
+                "cannot read or fix rotation metadata."
+            )
+            return
+        if details.get("ffprobe_subprocess_error"):
+            print(f"{prefix} ffprobe subprocess error: {details['ffprobe_subprocess_error']}")
+            return
+        rc = details.get("ffprobe_returncode")
+        print(f"{prefix} ffprobe returncode={rc}")
+        if details.get("ffprobe_stderr_tail"):
+            print(f"{prefix} ffprobe stderr (tail): {details['ffprobe_stderr_tail']!r}")
+        cw = details.get("coded_width")
+        ch = details.get("coded_height")
+        codec = details.get("codec_name")
+        if cw is not None or ch is not None or codec:
+            print(f"{prefix} video stream: codec={codec!r} coded_size={cw}x{ch}")
+        tags = details.get("stream_tags") or {}
+        if tags:
+            # Most relevant for orientation debugging
+            rot_hint = {k: tags[k] for k in ("rotate", "rotation") if k in tags}
+            print(f"{prefix} stream tags (subset): {rot_hint or tags}")
+        side = details.get("side_data_summary") or []
+        if side:
+            print(f"{prefix} side_data_list summary: {json.dumps(side, default=str)}")
+        src = details.get("rotation_source")
+        raw = details.get("rotation_raw_value")
+        norm = details.get("normalized_degrees", 0)
+        print(
+            f"{prefix} parsed rotation: source={src!r} raw={raw!r} normalized_degrees={norm}"
+        )
+        if norm == 0 and not src:
+            print(
+                f"{prefix} no rotate/rotation in tags or side_data — "
+                "file may truly be landscape pixels, or uses a format ffprobe did not expose here."
+            )
+        preview = details.get("ffprobe_json_preview")
+        if preview:
+            print(f"{prefix} ffprobe json preview:\n{preview}")
+
+    @staticmethod
+    def _normalize_video_orientation(
+        video_path: str,
+        log_prefix: str = "[orientation]",
+    ) -> Tuple[str, int, Dict[str, Any]]:
+        """
+        Return (path_for_inference, applied_rotation_degrees, probe_details).
+        If rotation metadata exists, produce an upright temp MP4 via ffmpeg.
+        """
+        rotation_degrees, probe_details = probe_video_rotation_with_details(video_path)
+        AnalysisQueueService._log_rotation_probe(log_prefix, probe_details)
+
+        vf = AnalysisQueueService._rotation_vf(rotation_degrees)
+        if vf is None:
+            print(
+                f"{log_prefix} skip transcode: normalized rotation is 0 (no ffmpeg filter needed)."
+            )
+            return video_path, 0, probe_details
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as out_file:
+            out_path = out_file.name
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            video_path,
+            "-vf",
+            vf,
+            "-metadata:s:v:0",
+            "rotate=0",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            out_path,
+        ]
+        print(f"{log_prefix} running ffmpeg normalize: filter={vf!r}")
+        print(f"{log_prefix} ffmpeg cmd: {shlex.join(cmd)}")
+        print(f"{log_prefix} ffmpeg output path: {out_path}")
+        try:
+            proc = subprocess.run(
+                cmd,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except (FileNotFoundError, OSError, subprocess.SubprocessError) as exc:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            print(
+                f"{log_prefix} ffmpeg unavailable/failed ({exc!r}). "
+                "Using original source video for inference."
+            )
+            return video_path, 0, probe_details
+
+        if proc.returncode != 0:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            err_full = (proc.stderr or "").strip()
+            err_tail = err_full[-1200:] if err_full else ""
+            print(
+                f"{log_prefix} ffmpeg failed exit={proc.returncode}. "
+                f"Using original source video. stderr_tail:\n{err_tail}"
+            )
+            return video_path, 0, probe_details
+
+        try:
+            out_sz = os.path.getsize(out_path)
+        except OSError:
+            out_sz = -1
+        print(
+            f"{log_prefix} ffmpeg OK: normalized file size_bytes={out_sz} "
+            f"(rotation applied in pixels={rotation_degrees})"
+        )
+        _, out_probe = probe_video_rotation_with_details(out_path)
+        print(
+            f"{log_prefix} post-transcode probe: coded="
+            f"{out_probe.get('coded_width')}x{out_probe.get('coded_height')} "
+            f"normalized_degrees={out_probe.get('normalized_degrees')} "
+            f"tags={out_probe.get('stream_tags')}"
+        )
+
+        return out_path, rotation_degrees, probe_details
 
     @staticmethod
     def _save_output_json(data: Dict[str, Any]) -> None:
@@ -328,12 +531,14 @@ class AnalysisQueueService:
         async with message.process():
             request_id: Optional[str] = None
             temp_video_path: Optional[str] = None
+            normalized_video_path: Optional[str] = None
             try:
                 data = json.loads(message.body.decode("utf-8"))
                 request_id = data.get("id")
                 payload = data.get("payload", {})
                 video_url = payload.get("video_url")
                 input_duration_ms = int(payload.get("video_duration_ms", 0) or 0)
+                height_mm = self._parse_height_mm(payload)
 
                 if not request_id:
                     raise ValueError("Missing request id")
@@ -342,15 +547,43 @@ class AnalysisQueueService:
 
                 print(f"Received request id={request_id} video_url={video_url}")
                 temp_video_path = await asyncio.to_thread(self._download_video, video_url)
-                print(f"Downloaded video to {temp_video_path}")
+                try:
+                    dl_sz = os.path.getsize(temp_video_path)
+                except OSError:
+                    dl_sz = -1
+                print(
+                    f"[request id={request_id}] downloaded path={temp_video_path} "
+                    f"size_bytes={dl_sz}"
+                )
+                orientation_prefix = f"[orientation request_id={request_id}]"
+                inference_video_path, applied_rotation, _probe_details = await asyncio.to_thread(
+                    self._normalize_video_orientation, temp_video_path, orientation_prefix
+                )
+                print(
+                    f"[request id={request_id}] inference_input_path={inference_video_path} "
+                    f"applied_rotation_metadata_degrees={applied_rotation} "
+                    f"(same_as_download={inference_video_path == temp_video_path})"
+                )
+                if inference_video_path != temp_video_path:
+                    normalized_video_path = inference_video_path
+                    print(
+                        f"[request id={request_id}] using normalized temp file for inference: "
+                        f"{normalized_video_path}"
+                    )
 
-                result = await asyncio.to_thread(self._run_inference, temp_video_path)
+                print(f"[request id={request_id}] starting SwingInferenceService.run ...")
+                result = await asyncio.to_thread(self._run_inference, inference_video_path, height_mm)
+                print(f"[request id={request_id}] inference finished")
                 video_duration_ms = self._video_duration_ms(result, input_duration_ms)
                 phases = self._build_phases(result, video_duration_ms)
                 pose_frames = self._build_pose_frames(result)
                 segmentation_frames = self._build_segmentation_frames(result)
                 body_frames = self._build_body_frames(result)
                 video_info = self._build_video_info(result)
+                print(
+                    f"[request id={request_id}] result video_info={video_info!r} "
+                    f"pose_frames={len(pose_frames)}"
+                )
 
                 response = {
                     "id": request_id,
@@ -385,6 +618,11 @@ class AnalysisQueueService:
                 print(f"Request processing failed id={request_id}: {exc}")
                 traceback.print_exc()
             finally:
+                if normalized_video_path and os.path.exists(normalized_video_path):
+                    try:
+                        os.remove(normalized_video_path)
+                    except Exception:
+                        pass
                 if temp_video_path and os.path.exists(temp_video_path):
                     try:
                         os.remove(temp_video_path)
