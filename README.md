@@ -8,21 +8,31 @@ Setup guide for Ubuntu GPU: [SETUP_UBUNTU_GPU.md](SETUP_UBUNTU_GPU.md)
 ```bash
 cp .env.example .env   # optional: edit paths/devices
 pip install -r requirements.local.txt  # plus ultralytics for YOLOv8
-python app.py --video video_raw/IMG_6850_1.MOV
+python app.py
 ```
-Outputs are written to `$OUTPUT_ROOT/<video_name>/` (default `output/<video_name>/`):
-- `swing_result.json` — all frames (COCO keypoints) + detected swing events
-- `swing_overlay_slow4x.mp4` — overlay video at 4× slow motion
-- `phase_frames/` — stills for each detected phase
+Required env/input:
+- `HEIGHT_MM`
+- `VIDEO_FACE_ON_PATH`
+
+Optional for dual-view mode:
+- `VIDEO_DOWN_THE_LINE_PATH`
+- Provide DTL trimmed to start near the same moment as face-on; DTL phases are mapped from face-on rather than detected independently.
+
+Outputs are written to `$OUTPUT_ROOT/<session_name>/`:
+- `swing_result.json` — combined single-view / dual-view result
+- `face_on/` — raw result, overlay payload, slow overlay video, 9 phase frames
+- `down_the_line/` — same structure, only when DTL video is provided
 
 Key flags:
 - `--seg-disable` to skip club segmentation
 - `--device cuda:0` to force GPU
 - `--force-yolo-person` to bypass MMDetection and use YOLOv8 person detector
-- `--height-mm 1750` to estimate `dx/dy` in millimeters from the Address frame pose
+- `--height-mm 1750` required for mm-based output
+- `--video-face-on path/to/face_on.mov`
+- `--video-down-the-line path/to/dtl.mov`
 
 Environment overrides (all have CLI equivalents):
-- DEVICE, SEG_DEVICE, VIDEO_PATH, OUTPUT_ROOT
+- DEVICE, SEG_DEVICE, VIDEO_FACE_ON_PATH, VIDEO_DOWN_THE_LINE_PATH, OUTPUT_ROOT
 - POSE2D_CONFIG / POSE2D_WEIGHTS, DET_MODEL / DET_WEIGHTS, SEG_MODEL, PERSON_DET_MODEL
 - STRIDE, MAX_FRAMES, HEIGHT_MM, OVERLAY_SCORE_THR
 - SEG_IMGSZ, SEG_CONF, SEG_IOU, SEG_ALPHA, SEG_DISABLE, DET_DEBUG
