@@ -58,28 +58,34 @@ def _get_lead_shoulder(
 def _draw_stats_panel(
     frame: np.ndarray,
     body_points: Optional[dict],
-    shaft_angle: Optional[float],
-    hip_angle: Optional[float],
-    chest_angle: Optional[float],
+    display_angles: Optional[dict],
     calibration: Optional[dict],
+    display_meta: Optional[dict],
     panel_x: int = 10,
     panel_y: int = 200,
 ) -> None:
-    """Vẽ panel thống kê displacement; ưu tiên mm nếu JSON có calibration."""
+    """Draw a unified stats panel for both face-on and DTL overlays."""
     FONT       = cv2.FONT_HERSHEY_SIMPLEX
-    FS         = 0.55
+    FS         = 0.5
     THICKNESS  = 1
     LINE_H     = 28
     PAD        = 8
-    COL_W      = 330
-    use_mm = calibration is not None and calibration.get("mm_per_px") is not None
+    COL_W      = 420
+    use_mm = True
 
-    # Xây danh sách dòng
-    rows = [("Stats (mm est)" if use_mm else "Stats (px)", (255, 255, 255), True)]
+    rows = [("Stats (mm)", (255, 255, 255), True)]
+    if display_meta:
+        view_name = str(display_meta.get("view_name", "")).replace("_", " ").title()
+        face_on_fps = float(display_meta.get("face_on_fps", 0.0))
+        dtl_fps = float(display_meta.get("down_the_line_fps", 0.0))
+        sync_method = str(display_meta.get("sync_method", ""))
+        rows.append((f"View: {view_name}", (200, 200, 255), False))
+        rows.append((f"FPS    FO:{face_on_fps:>6.2f}  DTL:{dtl_fps:>6.2f}", (180, 255, 180), False))
+        if sync_method:
+            rows.append((f"Sync:  {sync_method}", (180, 220, 255), False))
     point_cfg = [
         ("Hip",      "hip"),
         ("Chest",    "chest"),
-        ("Shoulder", "shoulder"),
         ("Grip",     "grip"),
     ]
     for label, key in point_cfg:
@@ -87,21 +93,27 @@ def _draw_stats_panel(
         if bp is not None:
             dx = bp.get("dx_mm_est") if use_mm else bp.get("dx")
             dy = bp.get("dy_mm_est") if use_mm else bp.get("dy")
+            dz = bp.get("dz_mm_est") if use_mm else 0.0
             dx_str = f"{dx:+.1f}" if dx is not None else "  --"
             dy_str = f"{dy:+.1f}" if dy is not None else "  --"
-            text = f"{label:<9} dx:{dx_str:>7}  dy:{dy_str:>7} {'mm' if use_mm else 'px'}"
+            dz_str = f"{dz:+.1f}" if dz is not None else "  --"
+            text = f"{label:<7} dx:{dx_str:>7}  dy:{dy_str:>7}  dz:{dz_str:>7}"
         else:
-            text = f"{label:<9} dx:  --      dy:  --   {'mm' if use_mm else 'px'}"
+            text = f"{label:<7} dx:  --      dy:  --      dz:  --"
         rows.append((text, (220, 220, 220), False))
 
-    sa_str  = f"{shaft_angle:.1f} deg" if shaft_angle is not None else "--"
-    hip_str = f"{hip_angle:.1f} deg"   if hip_angle  is not None else "--"
-    chest_str = f"{chest_angle:.1f} deg" if chest_angle is not None else "--"
-    if use_mm:
-        rows.append((f"Scale:     {calibration['mm_per_px']:.3f} mm/px", (180, 255, 180), False))
-    rows.append((f"Shaft ang: {sa_str}",  (0, 255, 255), False))
-    rows.append((f"Chest ang: {chest_str}", (120, 220, 255), False))
-    rows.append((f"Hip ang:   {hip_str}", (255, 200, 80), False))
+    angle_cfg = [
+        ("Shaft", "shaft", (0, 255, 255)),
+        ("Chest", "chest", (120, 220, 255)),
+        ("Hip", "hip", (255, 200, 80)),
+    ]
+    for label, key, color in angle_cfg:
+        angle_pair = (display_angles or {}).get(key) or {}
+        fo = angle_pair.get("face_on_deg")
+        dtl = angle_pair.get("down_the_line_deg")
+        fo_str = f"{fo:.1f}" if fo is not None else "--"
+        dtl_str = f"{dtl:.1f}" if dtl is not None else "--"
+        rows.append((f"{label:<7} FO:{fo_str:>6}  DTL:{dtl_str:>6} deg", color, False))
 
     n_rows   = len(rows)
     box_h    = n_rows * LINE_H + PAD * 2
@@ -251,6 +263,7 @@ def render_overlay(
     output_path = os.path.abspath(output_path)
     data = _load_json(json_path)
     calibration = data.get("calibration")
+    display_meta = data.get("display_meta")
     frame_map = {
         int(item["frame"]): {
             "keypoints":          item.get("keypoints"),
@@ -259,6 +272,7 @@ def render_overlay(
             "body_points":        item.get("body_points"),
             "hip_angle":          item.get("hip_angle"),
             "chest_angle":        item.get("chest_angle"),
+            "display_angles":     item.get("display_angles"),
         }
         for item in data.get("frames", [])
     }
@@ -276,9 +290,9 @@ def render_overlay(
     # Build phase structures from detected events
     events = data.get("events", []) or []
     # phase_milestones: sorted list of (frame_id, label) for continuous display
-    # phase_exact_map: frame_id -> (phase_num, name, t) for exact-frame actions
+    # phase_exact_map: frame_id -> list[(phase_num, name, t)] for exact-frame actions
     phase_milestones: List[Tuple[int, str]] = []
-    phase_exact_map: Dict[int, Tuple[int, str, float]] = {}
+    phase_exact_map: Dict[int, List[Tuple[int, str, float]]] = {}
     if events:
         sorted_events = sorted(events, key=lambda e: int(e["frame"]))
         for i, ev in enumerate(sorted_events):
@@ -286,7 +300,7 @@ def render_overlay(
             fid_ev = int(ev["frame"])
             label = f"P{phase_num} - {ev['name']}"
             phase_milestones.append((fid_ev, label))
-            phase_exact_map[fid_ev] = (phase_num, ev["name"], float(ev.get("t", 0.0)))
+            phase_exact_map.setdefault(fid_ev, []).append((phase_num, ev["name"], float(ev.get("t", 0.0))))
 
     def _get_phase_label(fid: int) -> Optional[str]:
         """Return the active phase label for frame fid (O(n_phases))."""
@@ -436,22 +450,15 @@ def render_overlay(
             cv2.putText(frame, label, (x + 15, y + 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 2, cv2.LINE_AA)
 
-        # Draw lead-shoulder → grip line (for P5 debug)
+        # Draw lead-shoulder → grip line
         lead_sho = _get_lead_shoulder(keypoints, score_thr, lead_is_right)
         if lead_sho is not None and grip_c is not None:
             ls_pt = (int(lead_sho[0]), int(lead_sho[1]))
             gr_pt = (int(grip_c[0]),   int(grip_c[1]))
             cv2.line(frame, ls_pt, gr_pt, (0, 165, 255), 2)   # orange line
             cv2.circle(frame, ls_pt, 8, (0, 165, 255), -1)    # orange dot on lead shoulder
-            dx = grip_c[0] - lead_sho[0]
-            dy = grip_c[1] - lead_sho[1]
-            lg_angle = math.degrees(math.atan2(abs(dy), abs(dx) + 1e-6))
-            mid_x = int((ls_pt[0] + gr_pt[0]) / 2)
-            mid_y = int((ls_pt[1] + gr_pt[1]) / 2)
-            cv2.putText(frame, f"P5-line: {lg_angle:.1f}deg", (mid_x + 10, mid_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2, cv2.LINE_AA)
 
-        # Track shaft Y from live segmentation for UP/DOWN detection
+        # Track shaft Y from live segmentation if needed later
         if live_shaft_center is not None:
             shaft_y_history.append(live_shaft_center[1])
             if len(shaft_y_history) > 7:
@@ -459,18 +466,6 @@ def render_overlay(
             direction = _compute_direction(shaft_y_history)
             if direction is not None:
                 current_direction = direction
-
-        # Shaft angle text (from live segmentation)
-        if live_shaft_angle is not None:
-            ang_h = float(min(live_shaft_angle % 180.0, 180.0 - live_shaft_angle % 180.0))
-            cv2.putText(frame, f"angle: {ang_h:4.1f} deg", (20, 110),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3, cv2.LINE_AA)
-
-        # UP / DOWN label
-        if current_direction is not None:
-            color = (0, 255, 0) if current_direction == "UP" else (0, 0, 255)
-            cv2.putText(frame, current_direction, (20, 170),
-                        cv2.FONT_HERSHEY_SIMPLEX, 2.0, color, 5, cv2.LINE_AA)
 
         # Phase label (continuous, active from detected frame until next phase)
         phase_label = _get_phase_label(frame_id)
@@ -480,23 +475,37 @@ def render_overlay(
 
         # Exact phase frame: draw border + save image
         if frame_id in phase_exact_map:
-            phase_num, phase_name_exact, t_ev = phase_exact_map[frame_id]
             cv2.rectangle(frame, (0, 0), (width - 1, height - 1), (0, 255, 255), 6)
-            cv2.putText(frame, f"P{phase_num} - {phase_name_exact}", (20, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.4, (0, 255, 255), 4, cv2.LINE_AA)
             if phase_frames_out is not None:
                 os.makedirs(phase_frames_out, exist_ok=True)
-                fname = f"{frame_id:06d}_{phase_name_exact.replace(' ', '_')}_{t_ev:.3f}.jpg"
-                cv2.imwrite(os.path.join(phase_frames_out, fname), frame)
+            for idx_exact, (phase_num, phase_name_exact, t_ev) in enumerate(phase_exact_map[frame_id]):
+                cv2.putText(frame, f"P{phase_num} - {phase_name_exact}", (20, 50 + idx_exact * 42),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 3, cv2.LINE_AA)
+                if phase_frames_out is not None:
+                    fname = f"{frame_id:06d}_P{phase_num}_{phase_name_exact.replace(' ', '_')}_{t_ev:.3f}.jpg"
+                    cv2.imwrite(os.path.join(phase_frames_out, fname), frame)
 
         # Stats panel (bottom-left)
-        _bp       = frame_data.get("body_points") if frame_data else None
-        _hip_ang  = frame_data.get("hip_angle")   if frame_data else None
-        _chest_ang = frame_data.get("chest_angle") if frame_data else None
-        _shaft_ang = float(min(live_shaft_angle % 180.0, 180.0 - live_shaft_angle % 180.0)) \
-                     if live_shaft_angle is not None else \
-                     (stored_shaft_angle if stored_shaft_angle is not None else None)
-        _draw_stats_panel(frame, _bp, _shaft_ang, _hip_ang, _chest_ang, calibration,
+        _bp = frame_data.get("body_points") if frame_data else None
+        _display_angles = frame_data.get("display_angles") if frame_data else None
+        if _display_angles is None:
+            _display_angles = {
+                "shaft": {
+                    "face_on_deg": float(min(live_shaft_angle % 180.0, 180.0 - live_shaft_angle % 180.0))
+                    if live_shaft_angle is not None
+                    else (stored_shaft_angle if stored_shaft_angle is not None else 0.0),
+                    "down_the_line_deg": 0.0,
+                },
+                "chest": {
+                    "face_on_deg": frame_data.get("chest_angle") if frame_data else 0.0,
+                    "down_the_line_deg": 0.0,
+                },
+                "hip": {
+                    "face_on_deg": frame_data.get("hip_angle") if frame_data else 0.0,
+                    "down_the_line_deg": 0.0,
+                },
+            }
+        _draw_stats_panel(frame, _bp, _display_angles, calibration, display_meta,
                           panel_x=10, panel_y=height - 330)
 
         # Frame number (top-right corner)

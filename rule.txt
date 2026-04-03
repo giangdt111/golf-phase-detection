@@ -9,4 +9,8 @@ P8 => sau P7, gậy đang UP, nằm ngang, góc càng gần 0 độ càng tốt
 P9 => Sau P8, gậy đang UP, gậy vuông mặt đất, góc càng gần 90 độ càng tốt
 
 
-scp -r savvycom@10.22.4.182:/home/savvycom/AI_team/giangdt/ai_golf_swing .
+scp -r savvycom@10.22.4.182:/home/savvycom/AI_team/giangdt/ai_golf_swing/output .
+
+scp -r video savvycom@10.22.4.182:/home/savvycom/AI_team/giangdt/ai_golf_swing
+
+scp -r video-2 savvycom@10.22.4.182:/home/savvycom/AI_team/giangdt/ai_golf_swing
