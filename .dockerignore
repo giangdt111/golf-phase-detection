@@ -1,0 +1,48 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual envs
+.venv/
+venv/
+.envrc
+
+# Python tooling
+*.egg-info/
+.dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# Logs / outputs
+*.log
+/output/
+
+# Checkpoints and large models
+model/*.pth
+model/*.pth.tar
+model/*.pt
+*.pt
+*.onnx
+
+# Local env/config
+.env
+.env.local
+
+# Local video datasets
+/video/
+/video_raw/
+
+
+# Jupyter
+*.ipynb_checkpoints/
+
+# Temporary
+*.tmp
+*.bak
+output/
+video_raw/
