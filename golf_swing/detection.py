@@ -21,12 +21,26 @@ def init_person_yolo(model_path: Optional[str], device: Optional[str]):
         return None
     try:
         from ultralytics import YOLO  # type: ignore
+        import numpy as np
     except Exception:
         return None
     try:
         model = YOLO(model_path)
         if device:
             model.to(device)
+        # Force Ultralytics' lazy internal warmup (cuDNN init) here so the
+        # first real predict() never hits an uninitialized cuDNN context.
+        try:
+            dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+            model.predict(dummy, imgsz=64, verbose=False)
+        except Exception as exc:
+            if device and "cuda" in str(device).lower():
+                print(
+                    f"[WARN] YOLO CUDA warmup failed ({exc}); falling back to CPU."
+                )
+                model.to("cpu")
+                dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+                model.predict(dummy, imgsz=64, verbose=False)
         return model
     except Exception:
         return None

@@ -8,13 +8,21 @@ import numpy as np
 def init_seg_model(model_path: str):
     try:
         from ultralytics import YOLO
+        import numpy as np
     except Exception as exc:  # pragma: no cover - ultralytics optional
         print(f"Ultralytics not available for segmentation: {exc}")
         return None
     if not os.path.exists(model_path):
         print(f"Segmentation model not found: {model_path}")
         return None
-    return YOLO(model_path)
+    model = YOLO(model_path)
+    # Trigger Ultralytics' lazy internal warmup now so cuDNN is ready.
+    try:
+        dummy = np.zeros((64, 64, 3), dtype=np.uint8)
+        model.predict(dummy, imgsz=64, verbose=False)
+    except Exception as exc:
+        print(f"[WARN] Seg model warmup failed ({exc}); model may run on CPU.")
+    return model
 
 
 def apply_segmentation_with_line(
