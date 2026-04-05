@@ -24,19 +24,20 @@ RUN python -m mim install "mmengine>=0.10.0"
 RUN python -m mim install "mmcv>=2.1.0"
 RUN python -m mim install "mmdet>=3.1.0"
 
-# 3. Pin numpy<2.0 AFTER all mim installs — mim/mmcv pull numpy 2.x as a
-#    dependency, overriding any earlier pin. The xtcocotools prebuilt wheel
-#    was compiled against numpy 1.x (dtype struct = 96 bytes); numpy 2.x
-#    changed it to 88 bytes, causing a runtime ABI crash. Force-reinstall
-#    to downgrade numpy back to 1.x before installing xtcocotools.
-RUN pip install --no-cache-dir --force-reinstall "numpy<2.0"
-
-# 4. Remaining runtime deps (including xtcocotools) — numpy<2.0 is now locked
+# 3. Remaining runtime deps (including xtcocotools binary wheel)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Queue-service-specific deps (not in requirements.txt)
+# 4. Queue-service-specific deps (not in requirements.txt)
 RUN pip install --no-cache-dir aio-pika
+
+# 5. Force numpy<2.0 as the VERY LAST pip step.
+#    Every prior install (mim, mmcv, requirements.txt) can silently pull in
+#    numpy 2.x. The xtcocotools prebuilt wheel was compiled against numpy 1.x
+#    (dtype struct = 96 bytes); numpy 2.x changed it to 88 bytes, causing:
+#    "ValueError: numpy.dtype size changed, may indicate binary incompatibility"
+#    Nothing runs after this, so numpy cannot be upgraded again.
+RUN pip install --no-cache-dir --force-reinstall "numpy<2.0"
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Application code
