@@ -18,17 +18,25 @@ WORKDIR /app
 # 1. Packaging tools
 RUN pip install --no-cache-dir -U pip wheel "setuptools<70"
 
-# 2. OpenMMLab stack (torch already in base image)
+# 2. Pin numpy to 1.x BEFORE anything else touches it.
+#    xtcocotools prebuilt wheels are compiled against numpy 1.x ABI;
+#    numpy 2.0 changed the dtype struct size (96→88 bytes) causing:
+#    "ValueError: numpy.dtype size changed, may indicate binary incompatibility"
+RUN pip install --no-cache-dir "numpy<2.0"
+
+# 3. OpenMMLab stack (torch already in base image)
 RUN pip install --no-cache-dir openmim
 RUN python -m mim install "mmengine>=0.10.0"
 RUN python -m mim install "mmcv>=2.1.0"
 RUN python -m mim install "mmdet>=3.1.0"
 
-# 3. Remaining runtime deps from requirements.txt
+# 4. Remaining runtime deps from requirements.txt
+#    Install xtcocotools with --no-binary to recompile its Cython extension
+#    against the already-pinned numpy, guaranteeing ABI alignment.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --no-binary xtcocotools -r requirements.txt
 
-# 4. Queue-service-specific deps (not in requirements.txt)
+# 5. Queue-service-specific deps (not in requirements.txt)
 RUN pip install --no-cache-dir aio-pika
 
 # ──────────────────────────────────────────────────────────────────────────────
