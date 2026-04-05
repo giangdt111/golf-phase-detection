@@ -36,10 +36,10 @@ Always use:
 ### 1. Base packaging tools
 
 ```bash
-python -m pip install -U pip wheel "setuptools<70"
+python -m pip install -U pip wheel setuptools
 ```
 
-`setuptools<70` avoids the `pkg_resources` issue seen when building package metadata for older OpenMMLab dependencies.
+Older installs used `setuptools<70` to work around a `pkg_resources` issue in early OpenMMLab builds; this is no longer needed with current mmengine/mmcv/mmdet/mmpose.
 
 ### 2. Install PyTorch first
 
@@ -61,14 +61,16 @@ python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda
 
 ```bash
 python -m pip install openmim
-python -m mim install "mmengine>=0.6.0,<1.0.0"
-python -m mim install "mmcv>=2.0.0rc4,<2.1.0"
-python -m mim install "mmdet>=3.0.0,<3.1.0"
+python -m mim install "mmengine>=0.10.0"
+python -m mim install "mmcv>=2.1.0"
+python -m mim install "mmdet>=3.1.0"
+python -m mim install "mmpose>=1.3.0"
 ```
 
 Notes:
 - `mmdet` is optional for this project. The app can run with YOLO person detection by passing `--force-yolo-person`.
 - `mmcv` is the sensitive package. If it does not find a prebuilt wheel for your PyTorch/CUDA combo, it will try to build from source and often fail or take a long time.
+- `mmpose>=1.3.0` is now installed via `openmim` as a proper package. The bundled `mmpose-main/` (v1.0.0) is kept as a fallback but the installed package takes precedence.
 
 ### 4. Install the remaining Python packages
 

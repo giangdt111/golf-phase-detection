@@ -6,7 +6,11 @@ def init_det_inferencer(det_model: Optional[str], det_weights: Optional[str], de
     if not det_model or det_model in ("whole_image", "whole-image"):
         return None
     try:
-        from mmdet.apis.det_inferencer import DetInferencer  # type: ignore
+        # mmdet >= 3.1 exports DetInferencer directly from mmdet.apis
+        try:
+            from mmdet.apis import DetInferencer  # type: ignore
+        except ImportError:
+            from mmdet.apis.det_inferencer import DetInferencer  # type: ignore
     except Exception:
         return None
     return DetInferencer(det_model, det_weights, device=device)
