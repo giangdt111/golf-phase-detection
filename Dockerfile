@@ -16,13 +16,24 @@ WORKDIR /app
 # ──────────────────────────────────────────────────────────────────────────────
 
 # 1. Packaging tools
-RUN pip install --no-cache-dir -U pip wheel "setuptools<70"
+#    No setuptools version cap — the <70 pin is a legacy workaround that is no
+#    longer needed and breaks pkg_resources in pip's isolated build envs.
+RUN pip install --no-cache-dir -U pip wheel setuptools
 
 # 2. OpenMMLab stack (torch already in base image)
+#
+#    mmcv: only 2.2.0 has a prebuilt wheel for cu121/torch2.3.x.
+#          mmcv 2.1.0 has no wheel and fails source-build.
+#
+#    mmdet: every PyPI release (≤3.3.0) hard-codes mmcv_maximum_version='2.2.0'
+#           with a strict < check, so all released builds reject mmcv 2.2.0.
+#           The fix (mmcv_maximum_version='2.3.0') landed in the dev-3.x branch
+#           (PR #11680) but has not shipped to PyPI yet — build from source.
 RUN pip install --no-cache-dir openmim
 RUN python -m mim install "mmengine>=0.10.0"
-RUN python -m mim install "mmcv>=2.1.0"
-RUN python -m mim install "mmdet>=3.1.0"
+RUN python -m mim install "mmcv>=2.2.0,<2.3.0"
+RUN pip install --no-cache-dir --no-build-isolation \
+        git+https://github.com/open-mmlab/mmdetection.git@dev-3.x
 
 # 3. Remaining runtime deps (including xtcocotools binary wheel)
 COPY requirements.txt .

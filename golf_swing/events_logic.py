@@ -305,7 +305,7 @@ def detect_swing_phases(
 ) -> List[Dict[str, float]]:
     """Detect golf swing phases sequentially."""
     if not frames:
-        return []
+        return [], {}
 
     features = compute_swing_features(frames, swing_direction=swing_direction)
     frame_ids = [f.frame_id for f in frames]
@@ -314,7 +314,7 @@ def detect_swing_phases(
     n = min(len(frames), len(shaft_angles), len(shaft_centers),
             *(len(v) for v in features.values() if hasattr(v, '__len__')))
     if n <= 0:
-        return []
+        return [], {}
 
     frames        = frames[:n]
     frame_ids     = frame_ids[:n]

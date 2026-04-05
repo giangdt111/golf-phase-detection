@@ -360,6 +360,8 @@ def detect_events_rule9(
     shaft_angles: List[Optional[float]],
     club_centers: List[Optional[Tuple[float, float]]],
     shaft_centers: List[Optional[Tuple[float, float]]],
+    debug: bool = False,
+    debug_path: str = "phase_debug.csv",
 ):
     from .events_logic import detect_events_rule9  # type: ignore
     return detect_events_rule9(
@@ -369,6 +371,8 @@ def detect_events_rule9(
         shaft_angles,
         club_centers,
         shaft_centers,
+        debug=debug,
+        debug_path=debug_path,
     )
 
 
