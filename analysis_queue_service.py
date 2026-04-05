@@ -7,6 +7,7 @@ the source video, and responds with phases, pose_frames, and video duration.
 """
 
 import asyncio
+import concurrent.futures
 import json
 import os
 import random
@@ -146,6 +147,10 @@ class AnalysisQueueService:
     def __init__(self) -> None:
         self._channel: Optional[aio_pika.abc.AbstractChannel] = None
         self._service = SwingInferenceService()
+        # Single-thread executor so warmup and all inference share the same
+        # CUDA context.  asyncio.to_thread uses the default pool which can
+        # assign a different OS thread each call, losing the cuDNN context.
+        self._gpu_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
     def _inference_kwargs(self) -> Dict[str, Any]:
         return {
@@ -572,7 +577,12 @@ class AnalysisQueueService:
                     )
 
                 print(f"[request id={request_id}] starting SwingInferenceService.run ...")
-                result = await asyncio.to_thread(self._run_inference, inference_video_path, height_mm)
+                _loop = asyncio.get_running_loop()
+                _vp, _hm = inference_video_path, height_mm
+                result = await _loop.run_in_executor(
+                    self._gpu_executor,
+                    lambda: self._run_inference(_vp, _hm),
+                )
                 print(f"[request id={request_id}] inference finished")
                 video_duration_ms = self._video_duration_ms(result, input_duration_ms)
                 phases = self._build_phases(result, video_duration_ms)
@@ -658,9 +668,11 @@ class AnalysisQueueService:
         print(f"Responding on queue: {RESPONSE_QUEUE}")
 
         print("Loading and caching inference models...")
-        await asyncio.to_thread(
-            self._service.warmup,
-            **self._inference_kwargs(),
+        loop = asyncio.get_running_loop()
+        kwargs = self._inference_kwargs()
+        await loop.run_in_executor(
+            self._gpu_executor,
+            lambda: self._service.warmup(**kwargs),
         )
         print("Models ready. Starting consumer.")
 
