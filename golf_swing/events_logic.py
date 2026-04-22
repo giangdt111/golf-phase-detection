@@ -349,14 +349,50 @@ def detect_swing_phases(
         grip_spd[i] = float(np.linalg.norm(grip_xy[i] - grip_xy[i - 1]))
     grip_spd = _smooth(grip_spd, w=5)
 
-    # Two-hand grip filter: ||mid_wrist - grip_xy|| nhỏ → cả 2 tay trên gậy
+    # Two-hand grip geometry for Address detection
     _lw = features['left_wrist']
     _rw = features['right_wrist']
-    mid_wrist_dist = np.full(n, np.inf)
+    wrist_grip_dist_l = np.full(n, np.inf)
+    wrist_grip_dist_r = np.full(n, np.inf)
+    wrist_shaft_perp_l = np.full(n, np.inf)
+    wrist_shaft_perp_r = np.full(n, np.inf)
+    wrist_shaft_along_l = np.full(n, np.inf)
+    wrist_shaft_along_r = np.full(n, np.inf)
+    grip_below_hip = np.zeros(n, dtype=bool)
     for i in range(n):
-        if np.isfinite(_lw[i]).all() and np.isfinite(_rw[i]).all():
-            mid = (_lw[i] + _rw[i]) / 2.0
-            mid_wrist_dist[i] = float(np.linalg.norm(mid - grip_xy[i]))
+        gp = grip_xy[i]
+        hp = hip_xy[i]
+        lw = _lw[i]
+        rw = _rw[i]
+        if np.isfinite(gp).all() and np.isfinite(hp).all():
+            grip_below_hip[i] = bool(gp[1] >= hp[1] + 0.08 * body_scale)
+        if not np.isfinite(gp).all():
+            continue
+        if np.isfinite(lw).all():
+            wrist_grip_dist_l[i] = float(np.linalg.norm(lw - gp))
+        if np.isfinite(rw).all():
+            wrist_grip_dist_r[i] = float(np.linalg.norm(rw - gp))
+
+        sc = shaft_centers[i]
+        if sc is None:
+            continue
+        shaft_ctr = np.asarray(sc, dtype=float)
+        if not np.isfinite(shaft_ctr).all():
+            continue
+        shaft_vec = shaft_ctr - gp
+        shaft_norm = float(np.linalg.norm(shaft_vec))
+        if shaft_norm <= 1e-6:
+            continue
+        shaft_unit = shaft_vec / shaft_norm
+        normal_unit = np.array([-shaft_unit[1], shaft_unit[0]], dtype=float)
+        if np.isfinite(lw).all():
+            rel_l = lw - gp
+            wrist_shaft_perp_l[i] = float(abs(np.dot(rel_l, normal_unit)))
+            wrist_shaft_along_l[i] = float(abs(np.dot(rel_l, shaft_unit)))
+        if np.isfinite(rw).all():
+            rel_r = rw - gp
+            wrist_shaft_perp_r[i] = float(abs(np.dot(rel_r, normal_unit)))
+            wrist_shaft_along_r[i] = float(abs(np.dot(rel_r, shaft_unit)))
 
     # ===== P1: Address — last stable frame before swing starts =====
     s_end  = max(3, min(n - 1, int(n * 0.35)))
@@ -375,12 +411,62 @@ def detect_swing_phases(
                0.4 * _normalize_cost(grip_spd.tolist()))
     p1 = _argmin_range(p1_cost, 0, max(1, onset))
 
-    # Refine P1: ưu tiên frame có cả 2 tay cầm gậy (mid_wrist gần grip)
-    _TH_TWO_HAND = 0.12 * body_scale
-    _two_hand_idxs = [i for i in range(min(onset + 1, n))
-                      if mid_wrist_dist[i] <= _TH_TWO_HAND]
-    if _two_hand_idxs:
-        p1 = int(_two_hand_idxs[int(np.argmin(p1_cost[_two_hand_idxs]))])
+    # Address candidates: grip below hip, both wrists near the shaft, and both wrists near grip.
+    _TH_WRIST_TO_SHAFT_PERP = 0.08 * body_scale
+    _TH_WRIST_TO_SHAFT_ALONG = 0.22 * body_scale
+    _TH_WRIST_TO_GRIP = 0.22 * body_scale
+    address_mask = np.zeros(n, dtype=bool)
+    for i in range(min(onset + 1, n)):
+        dl = wrist_grip_dist_l[i]
+        dr = wrist_grip_dist_r[i]
+        if not grip_below_hip[i]:
+            continue
+        if not np.isfinite(dl) or not np.isfinite(dr):
+            continue
+        if dl > _TH_WRIST_TO_GRIP or dr > _TH_WRIST_TO_GRIP:
+            continue
+        ratio = max(dl, dr) / max(min(dl, dr), 1e-6)
+        if ratio > 1.35:
+            continue
+        if wrist_shaft_perp_l[i] > _TH_WRIST_TO_SHAFT_PERP or wrist_shaft_perp_r[i] > _TH_WRIST_TO_SHAFT_PERP:
+            continue
+        if wrist_shaft_along_l[i] > _TH_WRIST_TO_SHAFT_ALONG or wrist_shaft_along_r[i] > _TH_WRIST_TO_SHAFT_ALONG:
+            continue
+        address_mask[i] = True
+
+    # Require a short consecutive stable run; choose the last stable frame before onset.
+    best_run = None
+    run_start = None
+    _MIN_ADDRESS_RUN = 4
+    for i in range(min(onset + 1, n)):
+        if address_mask[i]:
+            if run_start is None:
+                run_start = i
+        elif run_start is not None:
+            run_end = i - 1
+            if run_end - run_start + 1 >= _MIN_ADDRESS_RUN:
+                best_run = (run_start, run_end)
+            run_start = None
+    if run_start is not None:
+        run_end = min(onset, n - 1)
+        if run_end - run_start + 1 >= _MIN_ADDRESS_RUN:
+            best_run = (run_start, run_end)
+
+    if best_run is not None:
+        run_start, run_end = best_run
+        stable_idxs = list(range(run_start, run_end + 1))
+        stable_cost = (
+            0.55 * p1_cost[stable_idxs]
+            + 0.20 * _normalize_cost(wrist_grip_dist_l[stable_idxs].tolist())
+            + 0.20 * _normalize_cost(wrist_grip_dist_r[stable_idxs].tolist())
+            + 0.05 * _normalize_cost(grip_spd[stable_idxs].tolist())
+        )
+        best_local = int(np.argmin(stable_cost))
+        p1 = stable_idxs[best_local]
+    else:
+        # If the strict rule finds no stable cluster, keep the original onset-based fallback
+        # instead of snapping to a weak single-frame candidate.
+        pass
 
     # Duyệt toàn bộ tín hiệu một lần, tìm tất cả đỉnh/đáy theo thứ tự
     _THR = 15.0
