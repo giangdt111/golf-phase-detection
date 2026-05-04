@@ -14,3 +14,6 @@ scp -r savvycom@10.22.4.182:/home/savvycom/AI_team/giangdt/ai_golf_swing/output 
 scp -r video savvycom@10.22.4.182:/home/savvycom/AI_team/giangdt/ai_golf_swing
 
 scp -r video-2 savvycom@10.22.4.182:/home/savvycom/AI_team/giangdt/ai_golf_swing
+
+cp -r /mnt/c/Truong-Giang/10.DEV/golf/video/fo .
+cp -r output /mnt/c/Truong-Giang/10.DEV/golf

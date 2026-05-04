@@ -1,21 +1,32 @@
-# Setup On Ubuntu GPU
+# Setup On Ubuntu / WSL GPU
 
-This repo runs inference from `app.py` and loads the vendored `mmpose-main/` source directly from the repository.
+This repo runs inference from `app.py` and loads the vendored `mmpose-main/`
+source directly from the repository.
 
-The main setup risk is environment mismatch:
+This guide reflects the environment that was verified to run successfully with:
+
+- Ubuntu on WSL
+- Python `3.10`
+- `venv` instead of Conda
+- CUDA-enabled PyTorch on `cuda:0`
+- YOLO person detection via `--force-yolo-person`
+
+The main setup risks for this repo are:
+
 - using `pip` from a different Python than `python`
-- using a too-new PyTorch/CUDA combo that has no compatible `mmcv` wheel
-- trying to install OpenMMLab packages with plain `pip` instead of `openmim`
+- installing an `mmcv` version that has no prebuilt wheel for your Torch/CUDA
+- letting `numpy` get upgraded to `2.x`, which breaks `xtcocotools`
+- letting `opencv-python` upgrade to a build that requires `numpy>=2`
 
 ## Recommended environment
 
-Use a dedicated Conda env and keep all install commands tied to that env's Python.
+Use a dedicated virtualenv and keep every install tied to that env's Python.
 
 ```bash
-cd /home/savvycom/AI_team/giangdt/ai_golf_swing
+cd /home/dinhthang26/projects/golf-phase-detection
 
-conda create -n golf_swing python=3.10 -y
-conda activate golf_swing
+python3.10 -m venv .venv
+source .venv/bin/activate
 
 which python
 python -V
@@ -23,29 +34,37 @@ python -m pip -V
 ```
 
 Expected outcome:
-- `python` points to `.../anaconda3/envs/golf_swing/bin/python`
-- `python -m pip -V` also points to the same env
 
-Do not use bare `pip` or bare `mim` if they resolve to `~/.local/bin/...`.
+- `python` points to `.../golf-phase-detection/.venv/bin/python`
+- `python -m pip -V` points to the same `.venv`
+
+Do not use bare `pip` or bare `mim` if they resolve outside the venv.
 Always use:
+
 - `python -m pip ...`
 - `python -m mim ...`
 
-## Install steps
+## Verified install steps
 
 ### 1. Base packaging tools
 
 ```bash
-python -m pip install -U pip wheel "setuptools<70"
+python -m pip install -U pip wheel
+python -m pip install "setuptools==69.5.1" "packaging==24.2"
 ```
 
-`setuptools<70` avoids the `pkg_resources` issue seen when building package metadata for older OpenMMLab dependencies.
+Why:
+
+- `setuptools==69.5.1` avoids the `pkg_resources` failure seen when `mmcv`
+  falls back to build logic.
+- `packaging==24.2` avoids drifting too far from what the OpenMMLab helper
+  packages expect.
 
 ### 2. Install PyTorch first
 
-Use a PyTorch/CUDA combination that OpenMMLab has wheels for.
+Use a Torch/CUDA combination that has a compatible `mmcv` wheel.
 
-Recommended:
+Verified working combo:
 
 ```bash
 python -m pip install torch==2.3.1 torchvision==0.18.1 --index-url https://download.pytorch.org/whl/cu121
@@ -57,34 +76,92 @@ Verify:
 python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-### 3. Install OpenMMLab runtime with `openmim`
+Expected output is similar to:
+
+```text
+2.3.1+cu121 12.1 True
+```
+
+### 3. Install OpenMMLab runtime
+
+Install `mmengine` with `mim`, but install `mmcv` explicitly from the OpenMMLab
+wheel index.
 
 ```bash
 python -m pip install openmim
 python -m mim install "mmengine>=0.6.0,<1.0.0"
-python -m mim install "mmcv>=2.0.0rc4,<2.1.0"
-python -m mim install "mmdet>=3.0.0,<3.1.0"
+python -m pip install --no-cache-dir \
+  "mmcv==2.2.0" \
+  -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.3.0/index.html
 ```
 
 Notes:
-- `mmdet` is optional for this project. The app can run with YOLO person detection by passing `--force-yolo-person`.
-- `mmcv` is the sensitive package. If it does not find a prebuilt wheel for your PyTorch/CUDA combo, it will try to build from source and often fail or take a long time.
 
-### 4. Install the remaining Python packages
+- The vendored `mmpose-main` accepts `mmcv<=2.2.0`.
+- The old `mmcv<2.1.0` path tends to fall back to source build and fail.
+- `mmdet` is not required for this repo if you run with `--force-yolo-person`.
+
+Optional:
 
 ```bash
-python -m pip install -r requirements.txt
+python -m pip uninstall -y mmdet
 ```
 
-If you want to avoid reinstalling `torch/mmcv/mmengine/mmdet`, you can also install only the runtime packages directly:
+### 4. Install runtime packages with pinned NumPy/OpenCV
+
+Install the repo runtime packages, but keep `numpy` and `opencv-python` pinned
+ to versions that work with `xtcocotools`.
 
 ```bash
-python -m pip install ultralytics numpy opencv-python pillow scipy matplotlib json_tricks munkres xtcocotools rich
+python -m pip install \
+  "numpy==1.26.4" \
+  "opencv-python==4.10.0.84" \
+  pillow \
+  scipy \
+  matplotlib \
+  json_tricks \
+  munkres \
+  rich \
+  ultralytics \
+  aio_pika
+```
+
+Then install `xtcocotools` without dependencies so it does not pull `numpy 2.x`
+back into the environment:
+
+```bash
+python -m pip install --no-deps --force-reinstall "xtcocotools==1.14.3"
+```
+
+Why this matters:
+
+- `numpy 2.x` caused `ValueError: numpy.dtype size changed`
+- newer `opencv-python` builds required `numpy>=2`
+- `xtcocotools` without `--no-deps` may re-upgrade `numpy`
+
+### 5. Verify the environment
+
+```bash
+python -c "import torch, mmcv, mmengine; print('torch', torch.__version__, torch.version.cuda, torch.cuda.is_available()); print('mmcv', mmcv.__version__); print('mmengine', mmengine.__version__)"
+python -c "import numpy, cv2; print('numpy', numpy.__version__); print('cv2', cv2.__version__)"
+python -c "from xtcocotools.coco import COCO; print('xtcocotools ok')"
+```
+
+Expected shape:
+
+```text
+torch 2.3.1+cu121 12.1 True
+mmcv 2.2.0
+mmengine 0.10.x
+numpy 1.26.4
+cv2 4.10.0.84
+xtcocotools ok
 ```
 
 ## Repo weights
 
 This repository already includes the weights used by the default config:
+
 - `model/hrnet_w48_coco_256x192-b9e0b3ab_20200708.pth`
 - `model/golf_segment.pt`
 - `model/yolov8n_person_detection.pt`
@@ -102,8 +179,10 @@ Typical GPU config:
 ```env
 DEVICE=cuda:0
 SEG_DEVICE=cuda:0
-VIDEO_PATH=video/A001_03220730_C001.mov
-OUTPUT_ROOT=output
+HEIGHT_MM=1750
+
+VIDEO_FACE_ON_PATH=video/face-on/1.mov
+VIDEO_DOWN_THE_LINE_PATH=video/down-the-line/1.mov
 
 POSE2D_CONFIG=mmpose-main/configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_hrnet-w48_8xb32-210e_coco-256x192.py
 POSE2D_WEIGHTS=model/hrnet_w48_coco_256x192-b9e0b3ab_20200708.pth
@@ -111,44 +190,128 @@ SEG_MODEL=model/golf_segment.pt
 PERSON_DET_MODEL=model/yolov8n_person_detection.pt
 ```
 
+If the video is outside the repo, use an absolute path. On WSL, Windows files
+usually live under `/mnt/c/...`.
+
+Examples:
+
+```env
+VIDEO_FACE_ON_PATH=/mnt/c/Users/<user>/Videos/face_on.mov
+VIDEO_DOWN_THE_LINE_PATH=/mnt/c/Users/<user>/Videos/down_the_line.mov
+```
+
 ## Run
 
-Recommended command on Ubuntu GPU:
+Recommended command:
 
 ```bash
-python app.py \
-  --video video/A001_03220730_C001.mov \
-  --device cuda:0 \
-  --seg-device cuda:0 \
-  --force-yolo-person
+python app.py --force-yolo-person
+```
+
+Useful variants:
+
+```bash
+python app.py --force-yolo-person --max-frames 30
+python app.py --video-face-on /abs/path/face_on.mov --force-yolo-person
+python app.py --video-face-on /abs/path/face_on.mov --video-down-the-line /abs/path/dtl.mov --force-yolo-person
 ```
 
 Outputs are written to:
-- `output/<video_name>/swing_result.json`
-- `output/<video_name>/swing_overlay_slow4x.mp4`
-- `output/<video_name>/phase_frames/`
 
-## Quick validation
+- `output/<session_name>/swing_result.json`
+- `output/<session_name>/face_on/raw_result.json`
+- `output/<session_name>/face_on/overlay_payload.json`
+- `output/<session_name>/face_on/swing_overlay_slow4x.mp4`
+- `output/<session_name>/face_on/phase_frames/`
 
-```bash
-python -c "import torch, mmengine, mmcv, ultralytics; print('torch', torch.__version__, torch.version.cuda, torch.cuda.is_available()); print('mmengine', mmengine.__version__); print('mmcv', mmcv.__version__); print('ultralytics', ultralytics.__version__)"
-```
+Dual-view runs also write the same structure under `down_the_line/`.
 
-Then run a short inference:
+## WSL notes
 
-```bash
-python app.py --video video/A001_03220730_C001.mov --device cuda:0 --seg-device cuda:0 --force-yolo-person --max-frames 30
-```
+- If VS Code opens the repo in WSL, make sure the terminal is also using the
+  same WSL Python and the same `.venv`.
+- If `python app.py` says the video is not found, the path in `.env` is wrong.
+- Prefer storing videos in the Linux filesystem or use explicit `/mnt/c/...`
+  paths.
+
+## Known warnings
+
+These warnings were seen in a successful run and are not blockers by
+themselves:
+
+- `dataset_meta are not saved in the checkpoint's meta data, load via config`
+- `Failed to search registry with scope "mmpose"...`
+- `Failed to add LocalVisBackend, please provide the save_dir argument`
+- `Ultralytics settings reset to default values`
 
 ## Troubleshooting
 
-### `pip` and `python` point to different environments
+### `Face-on video not found`
 
-Symptoms:
-- `python -V` shows one version, but `pip -V` shows another
-- packages install successfully but imports still fail
+The path in `.env` or CLI does not exist.
+
+Check:
+
+```bash
+ls -l "$VIDEO_FACE_ON_PATH"
+```
+
+Or pass the file explicitly:
+
+```bash
+python app.py --video-face-on /abs/path/to/file.mov --force-yolo-person
+```
+
+### `ModuleNotFoundError: No module named 'mmcv'`
+
+`mmcv` is missing or installed in a different environment.
 
 Fix:
+
+```bash
+source .venv/bin/activate
+python -c "import mmcv; print(mmcv.__version__, mmcv.__file__)"
+```
+
+If it is missing, reinstall:
+
+```bash
+python -m pip install --no-cache-dir \
+  "mmcv==2.2.0" \
+  -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.3.0/index.html
+```
+
+### `ValueError: numpy.dtype size changed`
+
+This is an ABI mismatch between `numpy` and `xtcocotools`.
+
+Fix:
+
+```bash
+python -m pip uninstall -y xtcocotools numpy opencv-python pycocotools mmdet
+python -m pip install "setuptools==69.5.1" "packaging==24.2"
+python -m pip install "numpy==1.26.4" "opencv-python==4.10.0.84"
+python -m pip install --no-deps --force-reinstall "xtcocotools==1.14.3"
+```
+
+### `mim install mmcv` tries to build from source
+
+That usually means the selected `mmcv` version has no prebuilt wheel for your
+Torch/CUDA combination.
+
+Use the verified wheel directly instead:
+
+```bash
+python -m pip install --no-cache-dir \
+  "mmcv==2.2.0" \
+  -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.3.0/index.html
+```
+
+### `python` works but `pip` installed packages are not found
+
+This means `pip` and `python` are not using the same environment.
+
+Check:
 
 ```bash
 which python
@@ -159,40 +322,27 @@ which mim
 ```
 
 Use only:
+
 - `python -m pip ...`
 - `python -m mim ...`
 
-### `mim install mmcv` tries to build from source
+### CPU-only fallback
 
-This usually means your current PyTorch/CUDA combo has no matching prebuilt `mmcv` wheel.
-
-Fix:
-- recreate the env
-- install a supported PyTorch build first, for example `torch==2.3.1` with `cu121`
-- rerun `python -m mim install ...`
-
-### `ModuleNotFoundError: pkg_resources`
-
-Fix:
+If WSL cannot access CUDA, use CPU:
 
 ```bash
-python -m pip install "setuptools<70"
+python -m pip install torch==2.3.1 torchvision==0.18.1
 ```
 
-### `ImportError: libcudnn.so.9`
+Then set:
 
-This usually means you are importing `torch` from a different Python environment than the one you intended.
+```env
+DEVICE=cpu
+SEG_DEVICE=cpu
+```
 
-Fix:
-- check `which python`
-- check `python -m pip -V`
-- avoid `~/.local/bin/pip` and `~/.local/bin/mim`
+And run:
 
-## Notes on `requirements.txt`
-
-`requirements.txt` is provided as a package list for this repo, but the most reliable order on Ubuntu GPU is still:
-1. create env
-2. install PyTorch
-3. install `openmim`
-4. install `mmengine/mmcv/mmdet` with `python -m mim`
-5. install the remaining packages
+```bash
+python app.py --force-yolo-person
+```

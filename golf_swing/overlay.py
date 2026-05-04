@@ -40,7 +40,7 @@ def _get_lead_shoulder(
 ) -> Optional[Tuple[float, float]]:
     """Return lead-side shoulder point.
 
-    If lead_is_right is provided (globally determined from swing_direction),
+    If lead_is_right is provided (globally determined from setup geometry),
     use that. Otherwise fall back to per-frame arm score comparison.
     """
     if not keypoints:
@@ -58,6 +58,8 @@ def _get_lead_shoulder(
 def _draw_stats_panel(
     frame: np.ndarray,
     body_points: Optional[dict],
+    display_translations: Optional[dict],
+    display_rotations: Optional[dict],
     display_angles: Optional[dict],
     calibration: Optional[dict],
     display_meta: Optional[dict],
@@ -70,10 +72,13 @@ def _draw_stats_panel(
     THICKNESS  = 1
     LINE_H     = 28
     PAD        = 8
-    COL_W      = 420
-    use_mm = True
+    COL_W      = 520
+    use_inches = True
 
-    rows = [("Stats (mm)", (255, 255, 255), True)]
+    def _fmt(value) -> str:
+        return f"{float(value):+.1f}" if value is not None else "--"
+
+    rows = [("Stats (in)", (255, 255, 255), True)]
     if display_meta:
         view_name = str(display_meta.get("view_name", "")).replace("_", " ").title()
         face_on_fps = float(display_meta.get("face_on_fps", 0.0))
@@ -83,37 +88,47 @@ def _draw_stats_panel(
         rows.append((f"FPS    FO:{face_on_fps:>6.2f}  DTL:{dtl_fps:>6.2f}", (180, 255, 180), False))
         if sync_method:
             rows.append((f"Sync:  {sync_method}", (180, 220, 255), False))
+    rows.append(("+X lead   +Y up   +Z ball", (180, 255, 255), False))
     point_cfg = [
         ("Hip",      "hip"),
         ("Chest",    "chest"),
         ("Grip",     "grip"),
     ]
     for label, key in point_cfg:
-        bp = (body_points or {}).get(key)
-        if bp is not None:
-            dx = bp.get("dx_mm_est") if use_mm else bp.get("dx")
-            dy = bp.get("dy_mm_est") if use_mm else bp.get("dy")
-            dz = bp.get("dz_mm_est") if use_mm else 0.0
-            dx_str = f"{dx:+.1f}" if dx is not None else "  --"
-            dy_str = f"{dy:+.1f}" if dy is not None else "  --"
-            dz_str = f"{dz:+.1f}" if dz is not None else "  --"
-            text = f"{label:<7} dx:{dx_str:>7}  dy:{dy_str:>7}  dz:{dz_str:>7}"
-        else:
-            text = f"{label:<7} dx:  --      dy:  --      dz:  --"
+        tr = (display_translations or {}).get(key)
+        if tr is None:
+            bp = (body_points or {}).get(key)
+            tr = {
+                "x_in": bp.get("dx_in_est") if bp is not None and use_inches else None,
+                "y_in": bp.get("dy_in_est") if bp is not None and use_inches else None,
+                "z_in": bp.get("dz_in_est") if bp is not None and use_inches else None,
+            }
+        text = (
+            f"{label:<7} "
+            f"X:{_fmt(tr.get('x_in')):>7}  "
+            f"Y:{_fmt(tr.get('y_in')):>7}  "
+            f"Z:{_fmt(tr.get('z_in')):>7}"
+        )
         rows.append((text, (220, 220, 220), False))
 
-    angle_cfg = [
-        ("Shaft", "shaft", (0, 255, 255)),
+    rows.append(("Rotation deg (RX pending, RY turn, RZ tilt)", (180, 255, 255), False))
+    rotation_cfg = [
         ("Chest", "chest", (120, 220, 255)),
         ("Hip", "hip", (255, 200, 80)),
     ]
-    for label, key, color in angle_cfg:
-        angle_pair = (display_angles or {}).get(key) or {}
-        fo = angle_pair.get("face_on_deg")
-        dtl = angle_pair.get("down_the_line_deg")
-        fo_str = f"{fo:.1f}" if fo is not None else "--"
-        dtl_str = f"{dtl:.1f}" if dtl is not None else "--"
-        rows.append((f"{label:<7} FO:{fo_str:>6}  DTL:{dtl_str:>6} deg", color, False))
+    for label, key, color in rotation_cfg:
+        rot = (display_rotations or {}).get(key)
+        if rot is None:
+            angle_z = ((display_angles or {}).get(key) or {}).get("face_on_deg")
+            angle_y = ((display_angles or {}).get(f"{key}_y") or {}).get("face_on_deg")
+            rot = {"x_deg": None, "y_deg": angle_y, "z_deg": angle_z}
+        rows.append(
+            (
+                f"{label:<7} RX:{_fmt(rot.get('x_deg')):>7}  RY:{_fmt(rot.get('y_deg')):>7}  RZ:{_fmt(rot.get('z_deg')):>7}",
+                color,
+                False,
+            )
+        )
 
     n_rows   = len(rows)
     box_h    = n_rows * LINE_H + PAD * 2
@@ -135,6 +150,44 @@ def _draw_stats_panel(
         fs = FS * 1.1 if is_header else FS
         tw = THICKNESS + 1 if is_header else THICKNESS
         cv2.putText(frame, text, (x1 + PAD, ty), FONT, fs, color, tw, cv2.LINE_AA)
+
+
+def _draw_coordinate_axes(
+    frame: np.ndarray,
+    coordinate_system: Optional[dict],
+    display_meta: Optional[dict],
+    lead_is_right: Optional[bool],
+) -> None:
+    """Draw a small player-centric axis legend on the overlay."""
+    h, w = frame.shape[:2]
+    origin = (max(90, w - 150), 120)
+    axis_len = 58
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    view_name = str((display_meta or {}).get("view_name", "face_on"))
+    z_sign = float((((coordinate_system or {}).get("axes") or {}).get("z") or {}).get("image_x_sign", 1.0))
+
+    if view_name == "down_the_line":
+        x_vec = (-38, 34)
+        z_vec = (axis_len if z_sign >= 0.0 else -axis_len, 0)
+    else:
+        x_dir = -1 if lead_is_right else 1
+        x_vec = (axis_len * x_dir, 0)
+        z_vec = (38, 34)
+
+    axes = [
+        ("+X lead", x_vec, (0, 120, 255)),
+        ("+Y up", (0, -axis_len), (0, 220, 0)),
+        ("+Z ball", z_vec, (255, 120, 0)),
+    ]
+
+    cv2.circle(frame, origin, 4, (255, 255, 255), -1)
+    for label, vec, color in axes:
+        end = (int(origin[0] + vec[0]), int(origin[1] + vec[1]))
+        cv2.arrowedLine(frame, origin, end, color, 2, cv2.LINE_AA, tipLength=0.25)
+        tx = end[0] + (5 if vec[0] >= 0 else -70)
+        ty = end[1] + (-5 if vec[1] < 0 else 16)
+        cv2.putText(frame, label, (tx, ty), font, 0.45, color, 1, cv2.LINE_AA)
 
 
 def _compute_body_points(
@@ -263,6 +316,7 @@ def render_overlay(
     output_path = os.path.abspath(output_path)
     data = _load_json(json_path)
     calibration = data.get("calibration")
+    coordinate_system = data.get("coordinate_system")
     display_meta = data.get("display_meta")
     frame_map = {
         int(item["frame"]): {
@@ -270,22 +324,22 @@ def render_overlay(
             "shaft_angle_smooth": item.get("shaft_angle_smooth"),
             "shaft_smooth":       item.get("shaft_smooth"),
             "body_points":        item.get("body_points"),
+            "translations":       item.get("translations"),
             "hip_angle":          item.get("hip_angle"),
             "chest_angle":        item.get("chest_angle"),
+            "hip_y_angle":        item.get("hip_y_angle"),
+            "chest_y_angle":      item.get("chest_y_angle"),
             "display_angles":     item.get("display_angles"),
+            "display_rotations":  item.get("display_rotations"),
         }
         for item in data.get("frames", [])
     }
     edges = data.get("skeleton", {}).get("edges", COCO_SKELETON_EDGES)
 
     # Determine lead side globally (same logic as pipeline)
-    swing_direction = data.get("swing_direction")
-    if swing_direction == "clockwise":
-        lead_is_right = True
-    elif swing_direction == "counterclockwise":
-        lead_is_right = False
-    else:
-        lead_is_right = None  # unknown — fall back to per-frame
+    lead_is_right = data.get("lead_is_right")
+    if lead_is_right is not None:
+        lead_is_right = bool(lead_is_right)
 
     # Build phase structures from detected events
     events = data.get("events", []) or []
@@ -488,6 +542,8 @@ def render_overlay(
 
         # Stats panel (bottom-left)
         _bp = frame_data.get("body_points") if frame_data else None
+        _translations = frame_data.get("translations") if frame_data else None
+        _display_rotations = frame_data.get("display_rotations") if frame_data else None
         _display_angles = frame_data.get("display_angles") if frame_data else None
         if _display_angles is None:
             _display_angles = {
@@ -505,9 +561,32 @@ def render_overlay(
                     "face_on_deg": frame_data.get("hip_angle") if frame_data else 0.0,
                     "down_the_line_deg": 0.0,
                 },
+                "chest_y": {
+                    "face_on_deg": frame_data.get("chest_y_angle") if frame_data else 0.0,
+                    "down_the_line_deg": 0.0,
+                },
+                "hip_y": {
+                    "face_on_deg": frame_data.get("hip_y_angle") if frame_data else 0.0,
+                    "down_the_line_deg": 0.0,
+                },
             }
-        _draw_stats_panel(frame, _bp, _display_angles, calibration, display_meta,
-                          panel_x=10, panel_y=height - 330)
+        if _display_rotations is None:
+            _display_rotations = {
+                "chest": {
+                    "x_deg": None,
+                    "y_deg": frame_data.get("chest_y_angle") if frame_data else None,
+                    "z_deg": frame_data.get("chest_angle") if frame_data else None,
+                },
+                "hip": {
+                    "x_deg": None,
+                    "y_deg": frame_data.get("hip_y_angle") if frame_data else None,
+                    "z_deg": frame_data.get("hip_angle") if frame_data else None,
+                },
+            }
+        _draw_coordinate_axes(frame, coordinate_system, display_meta, lead_is_right)
+        _draw_stats_panel(frame, _bp, _translations, _display_rotations,
+                          _display_angles, calibration, display_meta,
+                          panel_x=10, panel_y=max(10, height - 390))
 
         # Frame number (top-right corner)
         fn_text = f"#{frame_id}"

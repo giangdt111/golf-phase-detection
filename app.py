@@ -5,8 +5,10 @@ Entrypoint for single-view and dual-view golf swing inference.
 import argparse
 import json
 import os
+from time import perf_counter
 from typing import Dict, List, Optional
 
+from aggregate_phase_metrics import generate_phase_metrics_summary
 from golf_swing.multiview import (
     build_combined_output,
     build_overlay_payload,
@@ -15,7 +17,9 @@ from golf_swing.multiview import (
 )
 from golf_swing.overlay import render_overlay
 from golf_swing.pipeline import SwingInferenceService
+from golf_swing.report import export_phase_metrics_workbook
 from golf_swing.segmentation import init_seg_model
+from golf_swing.utils import load_video_meta
 
 
 def _load_env_file(path: str = ".env") -> None:
@@ -51,6 +55,61 @@ def _env_float(name: str):
         return float(val)
     except ValueError:
         return None
+
+
+def _fmt_secs(value: float) -> str:
+    return f"{value:.2f}s"
+
+
+def _log_stage(name: str, started_at: float) -> None:
+    elapsed = perf_counter() - started_at
+    print(f"[TIMING] {name}: {_fmt_secs(elapsed)}")
+
+
+def _maybe_refresh_phase_metrics_summary(output_root: str) -> None:
+    if not _env_bool("AUTO_UPDATE_PHASE_METRICS_SUMMARY", False):
+        return
+    stage_started_at = perf_counter()
+    try:
+        summary_path = generate_phase_metrics_summary(output_root=output_root)
+        _log_stage("refresh_phase_metrics_summary", stage_started_at)
+        print(f"Wrote {summary_path}")
+    except Exception as exc:
+        _log_stage("refresh_phase_metrics_summary", stage_started_at)
+        print(f"[WARN] Failed to refresh phase metrics summary: {exc}")
+
+
+def _log_dual_view_input_info(face_video_path: str, dtl_video_path: Optional[str]) -> None:
+    if not dtl_video_path:
+        return
+
+    face_cap, face_meta = load_video_meta(face_video_path)
+    face_cap.release()
+    dtl_cap, dtl_meta = load_video_meta(dtl_video_path)
+    dtl_cap.release()
+
+    face_fps = float(face_meta["fps"])
+    dtl_fps = float(dtl_meta["fps"])
+    face_frames = int(face_meta["frame_count"])
+    dtl_frames = int(dtl_meta["frame_count"])
+    fps_delta = abs(face_fps - dtl_fps)
+    frame_delta = abs(face_frames - dtl_frames)
+
+    print("[INPUT] Dual-view video metadata:")
+    print(f"  Face-on: fps={face_fps:.3f} frames={face_frames}")
+    print(f"  DTL:     fps={dtl_fps:.3f} frames={dtl_frames}")
+    print(f"  Delta:   fps={fps_delta:.3f} frames={frame_delta}")
+
+    if fps_delta > 0.1:
+        print(
+            "[WARN] Input FPS differs noticeably between face-on and DTL. "
+            "The run will continue because the first frames are assumed aligned."
+        )
+    if frame_delta > 2:
+        print(
+            "[WARN] Input frame counts differ noticeably between face-on and DTL. "
+            "The run will continue because the first frames are assumed aligned."
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -207,6 +266,12 @@ def parse_args() -> argparse.Namespace:
         default=_env_bool("FORCE_PERSON_YOLO", False),
         help="Skip MMDetection detector and force YOLOv8 person (env: FORCE_PERSON_YOLO).",
     )
+    parser.add_argument(
+        "--render-disable",
+        action="store_true",
+        default=not _env_bool("RENDER_OUTPUT", True),
+        help="Disable overlay video + phase frame rendering (env: RENDER_OUTPUT=false).",
+    )
     return parser.parse_args()
 
 
@@ -302,6 +367,7 @@ def _run_view(
     args: argparse.Namespace,
     video_path: str,
     output_dir: str,
+    detect_events: bool,
 ) -> Dict:
     return service.run(
         video_path=video_path,
@@ -324,12 +390,14 @@ def _run_view(
         person_det_iou=args.person_det_iou,
         person_det_imgsz=args.person_det_imgsz,
         force_yolo_person=args.force_yolo_person,
-        debug_p9=True,
+        detect_events=detect_events,
+        debug_p9=detect_events,
         debug_p9_path=os.path.join(output_dir, "phase_debug.csv"),
     )
 
 
 def main() -> None:
+    total_started_at = perf_counter()
     _load_env_file()
     args = parse_args()
     if not args.video_face_on and args.legacy_video:
@@ -339,6 +407,7 @@ def main() -> None:
     dtl_video_path = _resolve_video_path(args.video_down_the_line)
     if dtl_video_path:
         dtl_video_path = _ensure_video_path(dtl_video_path, "Down-the-line")
+        _log_dual_view_input_info(face_video_path, dtl_video_path)
 
     if args.height_mm is None or float(args.height_mm) <= 0.0:
         raise SystemExit("HEIGHT_MM is required and must be > 0.")
@@ -349,11 +418,11 @@ def main() -> None:
     dtl_base = os.path.splitext(os.path.basename(dtl_video_path))[0] if dtl_video_path else ""
     mode = "dual_view" if dtl_video_path else "face_on_only"
 
+    output_root = os.path.abspath(os.getenv("OUTPUT_ROOT", "output"))
     if args.out:
         combined_json_path = os.path.abspath(args.out)
         output_dir = os.path.dirname(combined_json_path)
     else:
-        output_root = os.path.abspath(os.getenv("OUTPUT_ROOT", "output"))
         session_name = face_base if not dtl_video_path else f"{face_base}__{dtl_base}"
         output_dir = os.path.join(output_root, session_name)
         combined_json_path = os.path.join(output_dir, "swing_result.json")
@@ -364,28 +433,36 @@ def main() -> None:
     if dtl_video_path:
         os.makedirs(dtl_dir, exist_ok=True)
 
+    stage_started_at = perf_counter()
     service = SwingInferenceService()
-    face_raw = _run_view(service, args, face_video_path, face_dir)
+    _log_stage("service_init", stage_started_at)
+
+    stage_started_at = perf_counter()
+    face_raw = _run_view(service, args, face_video_path, face_dir, detect_events=True)
+    _log_stage("face_on_inference", stage_started_at)
     face_raw_json_path = os.path.join(face_dir, "raw_result.json")
     _dump_json(face_raw_json_path, face_raw)
 
     dtl_raw = None
     dtl_raw_json_path = ""
     if dtl_video_path:
-        dtl_raw = _run_view(service, args, dtl_video_path, dtl_dir)
-        dtl_raw["events"] = []
-        dtl_raw["events_raw"] = None
+        stage_started_at = perf_counter()
+        dtl_raw = _run_view(service, args, dtl_video_path, dtl_dir, detect_events=False)
+        _log_stage("down_the_line_inference", stage_started_at)
         dtl_raw_json_path = os.path.join(dtl_dir, "raw_result.json")
         _dump_json(dtl_raw_json_path, dtl_raw)
 
+    stage_started_at = perf_counter()
     sync = build_sync(face_raw, dtl_raw)
     combined_result = build_combined_output(mode, float(args.height_mm), face_raw, dtl_raw, sync)
     phase_pairs = build_phase_pairs(face_raw, dtl_raw, sync)
     combined_result["phase_frames"] = phase_pairs
+    _log_stage("multiview_combine", stage_started_at)
 
     face_events = _phase_events_from_pairs(phase_pairs, "face_on")
     dtl_events = _phase_events_from_pairs(phase_pairs, "down_the_line") if dtl_raw else []
 
+    stage_started_at = perf_counter()
     face_overlay_payload = build_overlay_payload("face_on", face_raw, combined_result, sync, face_events)
     face_overlay_payload_path = os.path.join(face_dir, "overlay_payload.json")
     _dump_json(face_overlay_payload_path, face_overlay_payload)
@@ -395,40 +472,49 @@ def main() -> None:
         dtl_overlay_payload = build_overlay_payload("down_the_line", dtl_raw, combined_result, sync, dtl_events)
         dtl_overlay_payload_path = os.path.join(dtl_dir, "overlay_payload.json")
         _dump_json(dtl_overlay_payload_path, dtl_overlay_payload)
+    _log_stage("overlay_payload_build", stage_started_at)
 
-    seg_model = None if args.seg_disable else init_seg_model(args.seg_model)
+    seg_model = None
+    if not args.render_disable:
+        stage_started_at = perf_counter()
+        seg_model = None if args.seg_disable else init_seg_model(args.seg_model)
+        _log_stage("render_model_init", stage_started_at)
 
     face_overlay_video = os.path.join(face_dir, "swing_overlay_slow4x.mp4")
     face_phase_frames_dir = os.path.join(face_dir, "phase_frames")
-    render_overlay(
-        face_video_path,
-        face_overlay_payload_path,
-        face_overlay_video,
-        args.overlay_score_thr,
-        slow_factor=4,
-        seg_model=seg_model,
-        seg_imgsz=args.seg_imgsz,
-        seg_conf=args.seg_conf,
-        seg_iou=args.seg_iou,
-        seg_device=args.seg_device,
-        seg_alpha=args.seg_alpha,
-        det_model=args.det_model,
-        det_weights=args.det_weights,
-        det_device=args.device,
-        det_debug=args.det_debug,
-        person_det_model=args.person_det_model,
-        person_det_conf=args.person_det_conf,
-        person_det_iou=args.person_det_iou,
-        person_det_imgsz=args.person_det_imgsz,
-        phase_frames_out=face_phase_frames_dir,
-    )
-    print(f"Wrote {face_overlay_video}")
+    if not args.render_disable:
+        stage_started_at = perf_counter()
+        render_overlay(
+            face_video_path,
+            face_overlay_payload_path,
+            face_overlay_video,
+            args.overlay_score_thr,
+            slow_factor=4,
+            seg_model=seg_model,
+            seg_imgsz=args.seg_imgsz,
+            seg_conf=args.seg_conf,
+            seg_iou=args.seg_iou,
+            seg_device=args.seg_device,
+            seg_alpha=args.seg_alpha,
+            det_model=args.det_model,
+            det_weights=args.det_weights,
+            det_device=args.device,
+            det_debug=args.det_debug,
+            person_det_model=args.person_det_model,
+            person_det_conf=args.person_det_conf,
+            person_det_iou=args.person_det_iou,
+            person_det_imgsz=args.person_det_imgsz,
+            phase_frames_out=face_phase_frames_dir,
+        )
+        _log_stage("face_on_render", stage_started_at)
+        print(f"Wrote {face_overlay_video}")
 
     dtl_overlay_video = ""
     dtl_phase_frames_dir = ""
-    if dtl_raw and dtl_video_path:
+    if dtl_raw and dtl_video_path and not args.render_disable:
         dtl_overlay_video = os.path.join(dtl_dir, "swing_overlay_slow4x.mp4")
         dtl_phase_frames_dir = os.path.join(dtl_dir, "phase_frames")
+        stage_started_at = perf_counter()
         render_overlay(
             dtl_video_path,
             dtl_overlay_payload_path,
@@ -451,6 +537,7 @@ def main() -> None:
             person_det_imgsz=args.person_det_imgsz,
             phase_frames_out=dtl_phase_frames_dir,
         )
+        _log_stage("down_the_line_render", stage_started_at)
         print(f"Wrote {dtl_overlay_video}")
 
     combined_result["views"]["face_on"].update(
@@ -470,8 +557,20 @@ def main() -> None:
         }
     )
     _attach_output_paths(combined_result, has_dtl=bool(dtl_raw))
+
+    metrics_workbook_path = os.path.join(output_dir, "phase_metrics.xlsx")
+    stage_started_at = perf_counter()
+    export_phase_metrics_workbook(combined_result, metrics_workbook_path, video_name=face_base)
+    combined_result["phase_metrics_xlsx"] = os.path.basename(metrics_workbook_path)
+    _log_stage("write_phase_metrics_xlsx", stage_started_at)
+    print(f"Wrote {metrics_workbook_path}")
+
+    stage_started_at = perf_counter()
     _dump_json(combined_json_path, combined_result)
+    _log_stage("write_combined_json", stage_started_at)
     print(f"Wrote {combined_json_path}")
+    _maybe_refresh_phase_metrics_summary(output_root)
+    _log_stage("total", total_started_at)
 
 
 if __name__ == "__main__":

@@ -282,6 +282,282 @@ def _compute_signals(
     )
 
 
+def _axis_y_turn_angle_from_width(
+    point_a: np.ndarray,
+    point_b: np.ndarray,
+    ref_idx: int,
+    n: int,
+) -> np.ndarray:
+    """Unsigned Y-axis turn proxy from horizontal foreshortening.
+
+    The reference width is measured at Address. As the segment turns around the
+    vertical axis in a face-on view, its visible horizontal width shortens:
+        angle_y = arccos(current_width_x / address_width_x)
+    """
+    out = np.full(n, np.nan)
+    if ref_idx < 0 or ref_idx >= n:
+        return out
+
+    ref_a = point_a[ref_idx]
+    ref_b = point_b[ref_idx]
+    if not (np.isfinite(ref_a).all() and np.isfinite(ref_b).all()):
+        return out
+
+    ref_width = abs(float(ref_b[0] - ref_a[0]))
+    if ref_width <= 1e-6:
+        return out
+
+    for i in range(n):
+        a = point_a[i]
+        b = point_b[i]
+        if not (np.isfinite(a).all() and np.isfinite(b).all()):
+            continue
+        curr_width = abs(float(b[0] - a[0]))
+        ratio = max(0.0, min(1.0, curr_width / ref_width))
+        out[i] = math.degrees(math.acos(ratio))
+    out = _smooth(_fill(out), w=5)
+    if 0 <= ref_idx < n and np.isfinite(out[ref_idx]):
+        out[ref_idx] = 0.0
+    return out
+
+
+def _compute_y_axis_turn_angles(
+    features: Dict[str, np.ndarray],
+    n: int,
+    ref_idx: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return (hip_y_angle, chest_y_angle), both unsigned in degrees."""
+    hip_y_angle = _axis_y_turn_angle_from_width(
+        features["left_hip"],
+        features["right_hip"],
+        ref_idx,
+        n,
+    )
+    chest_y_angle = _axis_y_turn_angle_from_width(
+        features["left_shoulder"],
+        features["right_shoulder"],
+        ref_idx,
+        n,
+    )
+    return hip_y_angle, chest_y_angle
+
+
+def _apply_signed_turn_stage(
+    angles: np.ndarray,
+    n: int,
+    p1: int,
+    p5: int,
+    p6: int,
+) -> np.ndarray:
+    """Convert unsigned face-on turn magnitude to a signed proxy.
+
+    Width foreshortening gives only turn magnitude. We add sign from the swing
+    stage: backswing and early downswing are negative, while the motion from
+    mid-downswing onward is positive. The sign flips smoothly between P5 and P6.
+    """
+    out = angles.copy()
+    if n <= 0:
+        return out
+
+    p1 = max(0, min(n - 1, int(p1)))
+    p5 = max(p1, min(n - 1, int(p5)))
+    p6 = max(p5, min(n - 1, int(p6)))
+
+    control_idx = [0, p1, p5, p6, n - 1]
+    control_sign = [0.0, 0.0, -1.0, 1.0, 1.0]
+    sign = np.interp(np.arange(n, dtype=float), control_idx, control_sign)
+
+    finite = np.isfinite(out)
+    out[finite] = out[finite] * sign[finite]
+    if 0 <= p1 < n and np.isfinite(out[p1]):
+        out[p1] = 0.0
+    return out
+
+
+def _angle_delta_signed_deg(current: float, reference: float) -> float:
+    delta = (float(current) - float(reference) + 180.0) % 360.0 - 180.0
+    if delta > 90.0:
+        delta -= 180.0
+    elif delta < -90.0:
+        delta += 180.0
+    return delta
+
+
+def _signed_segment_orientation_angles(
+    point_a: np.ndarray,
+    point_b: np.ndarray,
+    ref_idx: int,
+    n: int,
+    lead_is_right: bool,
+) -> np.ndarray:
+    """Signed face-on rotation proxy from left-right segment orientation.
+
+    This is an alternative to width-only foreshortening. We compare the
+    left->right segment angle against Address and normalize the sign by the
+    inferred lead side so backswing tends negative and follow-through positive.
+    """
+    out = np.full(n, np.nan)
+    if ref_idx < 0 or ref_idx >= n:
+        return out
+
+    ref_a = point_a[ref_idx]
+    ref_b = point_b[ref_idx]
+    if not (np.isfinite(ref_a).all() and np.isfinite(ref_b).all()):
+        return out
+
+    ref_angle = math.degrees(math.atan2(float(ref_b[1] - ref_a[1]), float(ref_b[0] - ref_a[0])))
+    sign_norm = -1.0 if lead_is_right else 1.0
+
+    for i in range(n):
+        a = point_a[i]
+        b = point_b[i]
+        if not (np.isfinite(a).all() and np.isfinite(b).all()):
+            continue
+        curr_angle = math.degrees(math.atan2(float(b[1] - a[1]), float(b[0] - a[0])))
+        out[i] = _angle_delta_signed_deg(curr_angle, ref_angle) * sign_norm
+
+    out = _smooth(_fill(out), w=5)
+    if 0 <= ref_idx < n and np.isfinite(out[ref_idx]):
+        out[ref_idx] = 0.0
+    return out
+
+
+def _compute_signed_orientation_turn_angles(
+    features: Dict[str, np.ndarray],
+    n: int,
+    ref_idx: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    lead_is_right = bool(features.get("lead_is_right", np.array([True]))[0])
+    hip_y_angle = _signed_segment_orientation_angles(
+        features["left_hip"],
+        features["right_hip"],
+        ref_idx,
+        n,
+        lead_is_right,
+    )
+    chest_y_angle = _signed_segment_orientation_angles(
+        features["left_shoulder"],
+        features["right_shoulder"],
+        ref_idx,
+        n,
+        lead_is_right,
+    )
+    return hip_y_angle, chest_y_angle
+
+
+def _build_toggle_direction_labels(
+    n: int,
+    turn_points: List[int],
+    initial_label: str = "UP",
+) -> np.ndarray:
+    labels = np.full(n, initial_label, dtype=object)
+    current_label = initial_label
+    start_idx = 0
+    for turn_idx in turn_points:
+        turn_idx = int(max(0, min(n - 1, turn_idx)))
+        labels[start_idx:turn_idx + 1] = current_label
+        current_label = "DOWN" if current_label == "UP" else "UP"
+        start_idx = turn_idx + 1
+    if start_idx < n:
+        labels[start_idx:] = current_label
+    return labels
+
+
+def _labels_from_slope(
+    values: np.ndarray,
+    threshold: float,
+    up_when_decreasing: bool,
+) -> np.ndarray:
+    n = len(values)
+    labels = np.full(n, "", dtype=object)
+    if n <= 1:
+        return labels
+    lag = max(2, n // 20)
+    for i in range(n):
+        lo = max(0, i - lag)
+        hi = min(n - 1, i + lag)
+        if hi <= lo:
+            continue
+        delta = float(values[hi] - values[lo])
+        if abs(delta) < threshold:
+            continue
+        if up_when_decreasing:
+            labels[i] = "UP" if delta < 0.0 else "DOWN"
+        else:
+            labels[i] = "DOWN" if delta > 0.0 else "UP"
+    return labels
+
+
+def _stabilize_direction_labels(labels: np.ndarray, min_run: int = 3) -> np.ndarray:
+    out = labels.copy()
+    n = len(out)
+    if n == 0:
+        return out
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and out[j] == out[i]:
+            j += 1
+        if j - i < min_run:
+            left = out[i - 1] if i > 0 else None
+            right = out[j] if j < n else None
+            fill = left or right or out[i]
+            out[i:j] = fill
+        i = j
+    return out
+
+
+def _build_fused_direction_labels(
+    sa_raw: np.ndarray,
+    grip_y: np.ndarray,
+    lead_grip_angle: np.ndarray,
+    p5: int,
+    threshold: float,
+) -> np.ndarray:
+    n = len(sa_raw)
+    shaft_signal = _smooth(_fill(np.where(np.isfinite(sa_raw), sa_raw, np.nan)), w=7)
+    shaft_extrema = _find_extrema(shaft_signal, min_delta=max(8.0, threshold * 0.5))
+    shaft_turns = [int(idx) for idx, _kind in shaft_extrema if 0 <= int(idx) < n]
+    shaft_labels = _build_toggle_direction_labels(n, shaft_turns, initial_label="UP")
+
+    grip_labels = _labels_from_slope(grip_y, threshold=max(6.0, np.nanstd(grip_y) * 0.05), up_when_decreasing=True)
+
+    fused = np.full(n, "UP", dtype=object)
+    prev = "UP"
+    for i in range(n):
+        votes = [shaft_labels[i]]
+        if grip_labels[i]:
+            votes.append(grip_labels[i])
+        up_votes = sum(1 for item in votes if item == "UP")
+        down_votes = sum(1 for item in votes if item == "DOWN")
+        if up_votes > down_votes:
+            prev = "UP"
+        elif down_votes > up_votes:
+            prev = "DOWN"
+        fused[i] = prev
+    return _stabilize_direction_labels(fused, min_run=3)
+
+
+def _next_extremum_with_direction(
+    extrema,
+    after: int,
+    kind: str,
+    fallback: int,
+    direction_labels: np.ndarray,
+    required_direction: str,
+    radius: int = 1,
+) -> int:
+    for idx, t in extrema:
+        if idx <= after or t != kind:
+            continue
+        lo = max(0, idx - radius)
+        hi = min(len(direction_labels), idx + radius + 1)
+        window = direction_labels[lo:hi]
+        if any(label == required_direction for label in window):
+            return idx
+    return fallback
+
+
 # ---------------------------------------------------------------------------
 # Phase detection
 # ---------------------------------------------------------------------------
@@ -291,6 +567,59 @@ PHASE_NAMES = [
     'Early-downswing', 'Mid-downswing', 'Ball-impact',
     'Mid-followthrough', 'Late-followthrough',
 ]
+
+
+def compute_body_signals(
+    frames: List[FramePose],
+    swing_direction: Optional[str],
+    shaft_angles: List[Optional[float]],
+    shaft_centers: List[Optional[Tuple[float, float]]],
+    ref_idx: int = 0,
+) -> Dict[str, np.ndarray]:
+    """Compute per-frame body/club signals without running phase detection."""
+    if not frames:
+        return {}
+
+    features = compute_swing_features(frames, swing_direction=swing_direction)
+    n = min(
+        len(frames),
+        len(shaft_angles),
+        len(shaft_centers),
+        *(len(v) for v in features.values() if hasattr(v, "__len__")),
+    )
+    if n <= 0:
+        return {}
+
+    shaft_angles = shaft_angles[:n]
+    shaft_centers = shaft_centers[:n]
+    features = {k: v[:n] for k, v in features.items() if hasattr(v, "__len__")}
+
+    body_scale = _estimate_body_scale(features)
+    sig = _compute_signals(shaft_angles, shaft_centers, features, n, body_scale)
+    body_signals = {
+        "hip_xy": sig["hip_xy"],
+        "chest_xy": sig["chest_xy"],
+        "shoulder_xy": sig["shoulder_xy"],
+        "grip_xy": sig["grip_xy"],
+        "hip_angle": sig["hip_angle"],
+        "chest_angle": sig["chest_angle"],
+        "lead_is_right": bool(features.get("lead_is_right", np.array([True]))[0]),
+    }
+
+    ref_idx = max(0, min(n - 1, int(ref_idx)))
+    hip_y_angle_legacy, chest_y_angle_legacy = _compute_y_axis_turn_angles(features, n, ref_idx)
+    hip_y_angle_experimental, chest_y_angle_experimental = _compute_signed_orientation_turn_angles(
+        features,
+        n,
+        ref_idx,
+    )
+    body_signals["hip_y_angle"] = hip_y_angle_legacy
+    body_signals["chest_y_angle"] = chest_y_angle_legacy
+    body_signals["hip_y_angle_legacy"] = hip_y_angle_legacy
+    body_signals["chest_y_angle_legacy"] = chest_y_angle_legacy
+    body_signals["hip_y_angle_experimental"] = hip_y_angle_experimental
+    body_signals["chest_y_angle_experimental"] = chest_y_angle_experimental
+    return body_signals
 
 
 def detect_swing_phases(
@@ -337,6 +666,33 @@ def detect_swing_phases(
     shoulder_xy = sig['shoulder_xy']
     hip_angle   = sig['hip_angle']
     chest_angle = sig['chest_angle']
+
+    body_signals = compute_body_signals(
+        frames,
+        swing_direction=swing_direction,
+        shaft_angles=shaft_angles,
+        shaft_centers=shaft_centers,
+        ref_idx=0,
+    )
+
+    # Short clips are not meaningful for 9-phase detection, but the pipeline
+    # should still return a stable shape for smoke tests / truncated runs.
+    if n < 3:
+        hip_y_angle_legacy, chest_y_angle_legacy = _compute_y_axis_turn_angles(features, n, 0)
+        hip_y_angle_experimental, chest_y_angle_experimental = _compute_signed_orientation_turn_angles(features, n, 0)
+        hip_y_angle = hip_y_angle_legacy
+        chest_y_angle = chest_y_angle_legacy
+        body_signals['hip_y_angle'] = hip_y_angle
+        body_signals['chest_y_angle'] = chest_y_angle
+        body_signals['hip_y_angle_legacy'] = hip_y_angle_legacy
+        body_signals['chest_y_angle_legacy'] = chest_y_angle_legacy
+        body_signals['hip_y_angle_experimental'] = hip_y_angle_experimental
+        body_signals['chest_y_angle_experimental'] = chest_y_angle_experimental
+        events = []
+        for k, name in enumerate(PHASE_NAMES):
+            idx = min(k, n - 1)
+            events.append({'name': name, 'frame': int(frame_ids[idx]), 't': float(times[idx])})
+        return events, body_signals
 
     # Derived: distance from horizontal / vertical — use RAW angle for phase detection
     # (smoothing can suppress true peaks/troughs; raw values reflect actual shaft position)
@@ -468,6 +824,10 @@ def detect_swing_phases(
         # instead of snapping to a weak single-frame candidate.
         pass
 
+    hip_y_angle_unsigned, chest_y_angle_unsigned = _compute_y_axis_turn_angles(features, n, p1)
+    body_signals['hip_y_angle_legacy'] = hip_y_angle_unsigned
+    body_signals['chest_y_angle_legacy'] = chest_y_angle_unsigned
+
     # Duyệt toàn bộ tín hiệu một lần, tìm tất cả đỉnh/đáy theo thứ tự
     _THR = 15.0
     sa_extrema = _find_extrema(sa_raw, min_delta=_THR)
@@ -507,20 +867,56 @@ def detect_swing_phases(
     # ===== P5: Early-downswing — đáy đầu tiên của lead_grip_angle sau P4 =====
     p5 = max(_next_extremum(lg_extrema, p4, 'trough', p4 + 1), p4 + 1)
 
+    direction_labels = _build_fused_direction_labels(sa_raw, grip_y, lead_grip_angle, p5, _THR)
+
     # ===== P6: Mid-downswing — đáy đầu tiên của sa_raw sau đỉnh đầu tiên sau P5 =====
     # Sau P5, gậy tăng lên đỉnh (đỉnh này nằm trước P6), rồi mới giảm xuống nằm ngang (P6).
     # Vì vậy cần bỏ qua đỉnh đầu tiên sau P5, rồi lấy đáy tiếp theo.
-    _p6_peak = _next_extremum(sa_extrema, p5, 'peak', p5)
-    p6 = max(_next_extremum(sa_extrema, _p6_peak, 'trough', _p6_peak + 1), p5 + 1)
+    _p6_peak = _next_extremum_with_direction(
+        sa_extrema, p5, 'peak', p5, direction_labels, required_direction='DOWN'
+    )
+    p6 = max(
+        _next_extremum_with_direction(
+            sa_extrema, _p6_peak, 'trough', _p6_peak + 1, direction_labels, required_direction='DOWN'
+        ),
+        p5 + 1,
+    )
 
     # ===== P7: Ball-impact — đỉnh đầu tiên của sa_raw sau P6 =====
-    p7 = max(_next_extremum(sa_extrema, p6, 'peak', p6 + 1), p6 + 1)
+    p7 = max(
+        _next_extremum_with_direction(
+            sa_extrema, p6, 'peak', p6 + 1, direction_labels, required_direction='DOWN'
+        ),
+        p6 + 1,
+    )
 
     # ===== P8: Mid-followthrough — đáy đầu tiên của sa_raw sau P7 =====
-    p8 = max(_next_extremum(sa_extrema, p7, 'trough', p7 + 1), p7 + 1)
+    p8 = max(
+        _next_extremum_with_direction(
+            sa_extrema, p7, 'trough', p7 + 1, direction_labels, required_direction='UP'
+        ),
+        p7 + 1,
+    )
 
     # ===== P9: Late-followthrough — đỉnh đầu tiên của sa_raw sau P8 =====
-    p9 = max(_next_extremum(sa_extrema, p8, 'peak', p8 + 1), p8 + 1)
+    p9 = max(
+        _next_extremum_with_direction(
+            sa_extrema, p8, 'peak', p8 + 1, direction_labels, required_direction='UP'
+        ),
+        p8 + 1,
+    )
+
+    hip_y_angle_legacy = _apply_signed_turn_stage(hip_y_angle_unsigned, n, p1, p5, p6)
+    chest_y_angle_legacy = _apply_signed_turn_stage(chest_y_angle_unsigned, n, p1, p5, p6)
+    hip_y_angle_experimental, chest_y_angle_experimental = _compute_signed_orientation_turn_angles(features, n, p1)
+    hip_y_angle = hip_y_angle_legacy
+    chest_y_angle = chest_y_angle_legacy
+    body_signals['hip_y_angle'] = hip_y_angle
+    body_signals['chest_y_angle'] = chest_y_angle
+    body_signals['hip_y_angle_legacy'] = hip_y_angle_legacy
+    body_signals['chest_y_angle_legacy'] = chest_y_angle_legacy
+    body_signals['hip_y_angle_experimental'] = hip_y_angle_experimental
+    body_signals['chest_y_angle_experimental'] = chest_y_angle_experimental
 
     idxs = [p1, p2, p3, p4, p5, p6, p7, p8, p9]
 
@@ -544,10 +940,11 @@ def detect_swing_phases(
                         'shoulder_x,shoulder_y,'
                         'grip_x,grip_y,'
                         'lead_grip_angle,'
+                        'hip_y_angle,chest_y_angle,'
                         'phase\n')
                 phase_at = {idxs[k]: f"P{k+1}-{PHASE_NAMES[k]}" for k in range(len(idxs))}
                 for i in range(n):
-                    d   = 'UP' if dir_up[i] else ('DOWN' if dir_dn[i] else '-')
+                    d   = str(direction_labels[i])
                     ph  = phase_at.get(i, '')
                     raw = f"{sa_raw[i]:.1f}" if np.isfinite(sa_raw[i]) else ''
                     sa  = f"{shaft_angle[i]:.1f}" if np.isfinite(shaft_angle[i]) else ''
@@ -556,7 +953,9 @@ def detect_swing_phases(
                     sx, sy = _xy(shoulder_xy, i)
                     gx, gy = _xy(grip_xy,     i)
                     lg = f"{lead_grip_angle[i]:.1f}" if np.isfinite(lead_grip_angle[i]) else ''
-                    f.write(f"{frame_ids[i]},{raw},{sa},{d},{hx},{hy},{cx},{cy},{sx},{sy},{gx},{gy},{lg},{ph}\n")
+                    hya = f"{hip_y_angle[i]:.1f}" if np.isfinite(hip_y_angle[i]) else ''
+                    cya = f"{chest_y_angle[i]:.1f}" if np.isfinite(chest_y_angle[i]) else ''
+                    f.write(f"{frame_ids[i]},{raw},{sa},{d},{hx},{hy},{cx},{cy},{sx},{sy},{gx},{gy},{lg},{hya},{cya},{ph}\n")
         except Exception as e:
             print(f"[WARN] phase debug write failed: {e}")
 
@@ -565,14 +964,6 @@ def detect_swing_phases(
         idx = int(max(0, min(int(idx), n - 1)))
         events.append({'name': PHASE_NAMES[k], 'frame': int(frame_ids[idx]), 't': float(times[idx])})
 
-    body_signals = {
-        'hip_xy':      hip_xy,
-        'chest_xy':    chest_xy,
-        'shoulder_xy': shoulder_xy,
-        'grip_xy':     grip_xy,
-        'hip_angle':   hip_angle,
-        'chest_angle': chest_angle,
-    }
     return events, body_signals
 
 
