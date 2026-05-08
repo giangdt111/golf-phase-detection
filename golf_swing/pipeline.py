@@ -1,11 +1,12 @@
 from typing import Any, Dict, List, Optional, Tuple
 import os
 import math
+from time import perf_counter
 import numpy as np
 
 from .constants import COCO_KEYPOINT_NAMES, COCO_SKELETON_EDGES
 from .events import FramePose, extract_keypoints, infer_swing_direction, safe_point
-from .events_logic import detect_events_rule9
+from .events_logic import compute_body_signals, detect_events_rule9
 from .pose import import_mmpose
 from .detection import (
     init_det_inferencer,
@@ -16,6 +17,17 @@ from .detection import (
 )
 from .segmentation import init_seg_model, segment_frame_features
 from .utils import temporary_cwd, load_video_meta
+
+MM_PER_INCH = 25.4
+
+
+def _translation_scale_correction() -> float:
+    value = os.getenv("TRANSLATION_SCALE_CORRECTION", "1.0")
+    try:
+        correction = float(value)
+    except ValueError:
+        return 1.0
+    return correction if correction > 0.0 else 1.0
 
 
 def _model_cache_key(**kwargs) -> tuple:
@@ -236,9 +248,11 @@ class SwingInferenceService:
         person_det_iou: float,
         person_det_imgsz: int,
         force_yolo_person: bool,
+        detect_events: bool = True,
         debug_p9: bool = False,
         debug_p9_path: str = "p9_debug.txt",
     ) -> Dict:
+        total_started_at = perf_counter()
         video_path = os.path.abspath(video_path)
         pose2d = os.path.abspath(pose2d) if pose2d else pose2d
         pose2d_weights = os.path.abspath(pose2d_weights) if pose2d_weights else pose2d_weights
@@ -247,9 +261,12 @@ class SwingInferenceService:
         if det_weights:
             det_weights = os.path.abspath(det_weights)
 
+        stage_started_at = perf_counter()
         cap, meta = load_video_meta(video_path)
         fps = meta["fps"]
+        print(f"[TIMING] pipeline.open_video: {perf_counter() - stage_started_at:.2f}s | {os.path.basename(video_path)}")
 
+        stage_started_at = perf_counter()
         inferencer, detector, yolo_person, seg_model = self._get_or_build_models(
             pose2d=pose2d,
             pose2d_weights=pose2d_weights,
@@ -261,6 +278,7 @@ class SwingInferenceService:
             seg_model_path=seg_model_path,
             seg_device=seg_device,
         )
+        print(f"[TIMING] pipeline.load_models: {perf_counter() - stage_started_at:.2f}s")
 
         frames: List[FramePose] = []
         shaft_angles: List[Optional[float]] = []
@@ -271,7 +289,7 @@ class SwingInferenceService:
         head_meas_traj: List[Optional[Tuple[float, float]]] = []
         shaft_meas_traj: List[Optional[Tuple[float, float]]] = []
         shaft_angle_pred_traj: List[Optional[float]] = []
-        person_bboxes: List[Optional[Tuple[int, ...]]] = []
+        person_bboxes: List[Optional[Tuple[int, int, int, int]]] = []
         frame_id = 0
         kept = 0
         last_bbox = None
@@ -337,9 +355,16 @@ class SwingInferenceService:
         gate_px = 220.0  # reject only extreme jumps
         vel_damp = 0.92
         max_step = 90.0  # px per frame cap on displacement
+        read_secs = 0.0
+        det_secs = 0.0
+        pose_secs = 0.0
+        seg_secs = 0.0
 
+        stage_started_at = perf_counter()
         while True:
+            step_started_at = perf_counter()
             ok, frame = cap.read()
+            read_secs += perf_counter() - step_started_at
             if not ok:
                 break
             if frame_id % stride != 0:
@@ -351,6 +376,7 @@ class SwingInferenceService:
             offset_x = 0
             offset_y = 0
             bbox = None
+            step_started_at = perf_counter()
             if detector is not None:
                 det_out = detector(frame, return_datasample=True).get("predictions", [])
                 det_sample = det_out[0] if det_out else None
@@ -363,6 +389,7 @@ class SwingInferenceService:
                     iou=person_det_iou,
                     imgsz=person_det_imgsz,
                 )
+            det_secs += perf_counter() - step_started_at
             if bbox is None:
                 bbox = last_bbox
             if bbox is not None:
@@ -374,7 +401,9 @@ class SwingInferenceService:
                 last_bbox = bbox
             person_bboxes.append(tuple(bbox) if bbox is not None else None)
 
+            step_started_at = perf_counter()
             result = inferencer(pose_frame, return_datasample=False, show=False)
+            pose_secs += perf_counter() - step_started_at
             if hasattr(result, "__iter__") and not isinstance(result, dict):
                 result = next(result)
             prediction = result.get("predictions", []) if isinstance(result, dict) else []
@@ -403,6 +432,7 @@ class SwingInferenceService:
                 if ang_state is not None and ang_P is not None:
                     ang_state, ang_P = _kf_predict_ang(ang_state, ang_P, dt=dt)
 
+                step_started_at = perf_counter()
                 angle, center, shaft_center = segment_frame_features(
                     frame,
                     model=seg_model,
@@ -414,6 +444,7 @@ class SwingInferenceService:
                     roi=bbox if bbox is not None else None,
                     grip_point=grip_mid,
                 )
+                seg_secs += perf_counter() - step_started_at
                 shaft_angles.append(angle)
                 club_centers.append(center)
                 shaft_centers.append(shaft_center)
@@ -516,6 +547,18 @@ class SwingInferenceService:
             kept += 1
 
         cap.release()
+        frame_loop_secs = perf_counter() - stage_started_at
+        eff_fps = (kept / frame_loop_secs) if frame_loop_secs > 1e-6 else 0.0
+        print(
+            f"[TIMING] pipeline.frame_loop: {frame_loop_secs:.2f}s | "
+            f"kept={kept} stride={stride} eff_fps={eff_fps:.2f}"
+        )
+        other_secs = max(0.0, frame_loop_secs - read_secs - det_secs - pose_secs - seg_secs)
+        print(
+            f"[TIMING] pipeline.frame_breakdown: "
+            f"read={read_secs:.2f}s det={det_secs:.2f}s pose={pose_secs:.2f}s "
+            f"seg={seg_secs:.2f}s other={other_secs:.2f}s"
+        )
 
         def _blend_smooth_positions(
             measured: List[Optional[Tuple[float, float]]],
@@ -566,21 +609,119 @@ class SwingInferenceService:
         shaft_angles_smooth = _blend_smooth_angles(shaft_angles, shaft_angle_pred_traj)
 
         inferred_direction = swing_direction or infer_swing_direction(frames)
-        events, body_signals = detect_events_rule9(
-            frames,
-            fps,
-            inferred_direction,
-            shaft_angles_smooth,
-            club_centers_smooth,
-            shaft_centers_smooth,
-            debug=debug_p9,
-            debug_path=debug_p9_path,
-        )
+        if detect_events:
+            stage_started_at = perf_counter()
+            events, body_signals = detect_events_rule9(
+                frames,
+                fps,
+                inferred_direction,
+                shaft_angles_smooth,
+                club_centers_smooth,
+                shaft_centers_smooth,
+                debug=debug_p9,
+                debug_path=debug_p9_path,
+            )
+            print(f"[TIMING] pipeline.event_detection: {perf_counter() - stage_started_at:.2f}s")
+        else:
+            stage_started_at = perf_counter()
+            body_signals = compute_body_signals(
+                frames,
+                swing_direction=inferred_direction,
+                shaft_angles=shaft_angles_smooth,
+                shaft_centers=shaft_centers_smooth,
+            )
+            events = []
+            print(f"[TIMING] pipeline.body_signal_build: {perf_counter() - stage_started_at:.2f}s")
 
         # --- Body points displacement (relative to Address / P1) ---
         frame_id_to_idx = {f.frame_id: i for i, f in enumerate(frames)}
         p1_frame_id = next((e['frame'] for e in events if e['name'] == 'Address'), None)
         p1_idx = frame_id_to_idx.get(p1_frame_id)
+        lead_is_right_value = body_signals.get("lead_is_right", True)
+        if isinstance(lead_is_right_value, np.ndarray):
+            lead_is_right = bool(lead_is_right_value[0]) if len(lead_is_right_value) else True
+        else:
+            lead_is_right = bool(lead_is_right_value)
+        x_axis_sign = -1.0 if lead_is_right else 1.0
+        y_axis_sign = -1.0
+
+        def _midpoint(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            if a is None or b is None:
+                return None
+            return (a + b) / 2.0
+
+        def _segment_length(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+            if a is None or b is None:
+                return None
+            return float(np.linalg.norm(a - b))
+
+        def _mean_valid(values: List[Optional[float]]) -> Optional[float]:
+            finite = [float(v) for v in values if v is not None and np.isfinite(v)]
+            if not finite:
+                return None
+            return float(sum(finite) / len(finite))
+
+        def _estimate_height_scale(
+            keypoints: Optional[List[Dict[str, float]]],
+            player_height_mm: Optional[float],
+        ) -> Optional[Dict[str, float]]:
+            if player_height_mm is None or player_height_mm <= 0 or not keypoints:
+                return None
+
+            shoulder_mid = _midpoint(safe_point(keypoints, 5), safe_point(keypoints, 6))
+            hip_mid = _midpoint(safe_point(keypoints, 11), safe_point(keypoints, 12))
+            torso_len = _segment_length(shoulder_mid, hip_mid)
+            left_leg = _mean_valid([
+                _segment_length(safe_point(keypoints, 11), safe_point(keypoints, 13)),
+                _segment_length(safe_point(keypoints, 13), safe_point(keypoints, 15)),
+            ])
+            right_leg = _mean_valid([
+                _segment_length(safe_point(keypoints, 12), safe_point(keypoints, 14)),
+                _segment_length(safe_point(keypoints, 14), safe_point(keypoints, 16)),
+            ])
+            leg_len = _mean_valid([left_leg, right_leg])
+
+            head_anchor_dist = _mean_valid([
+                _segment_length(safe_point(keypoints, idx), shoulder_mid) for idx in (0, 1, 2, 3, 4)
+            ])
+            if head_anchor_dist is not None:
+                head_len = head_anchor_dist * 1.18
+            elif torso_len is not None:
+                head_len = torso_len * 0.42
+            else:
+                head_len = None
+
+            if torso_len is None or leg_len is None or head_len is None:
+                return None
+
+            height_proxy_px = torso_len + leg_len + head_len
+            if not np.isfinite(height_proxy_px) or height_proxy_px <= 1e-6:
+                return None
+
+            correction = _translation_scale_correction()
+            raw_mm_per_px = float(player_height_mm / height_proxy_px)
+            raw_in_per_px = float((player_height_mm / MM_PER_INCH) / height_proxy_px)
+            return {
+                "height_mm": float(player_height_mm),
+                "height_in": round(float(player_height_mm / MM_PER_INCH), 3),
+                "height_proxy_px": round(float(height_proxy_px), 2),
+                "mm_per_px_raw": round(raw_mm_per_px, 6),
+                "in_per_px_raw": round(raw_in_per_px, 6),
+                "translation_scale_correction": round(correction, 6),
+                "mm_per_px": round(raw_mm_per_px * correction, 6),
+                "in_per_px": round(raw_in_per_px * correction, 6),
+                "source": "address_pose_height_proxy",
+            }
+
+        scale_info = None
+        in_per_px = None
+        scale_ref_idx = p1_idx
+        if scale_ref_idx is None:
+            scale_ref_idx = next((idx for idx, frame in enumerate(frames) if frame.keypoints), None)
+        if scale_ref_idx is not None and 0 <= scale_ref_idx < len(frames):
+            scale_info = _estimate_height_scale(frames[scale_ref_idx].keypoints, height_mm)
+            if scale_info is not None:
+                in_per_px = float(scale_info["in_per_px"])
 
         def _midpoint(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[np.ndarray]:
             if a is None or b is None:
@@ -669,12 +810,20 @@ class SwingInferenceService:
                     continue
                 x, y = round(float(v[0]), 1), round(float(v[1]), 1)
                 r = ref.get(key)
-                dx = round(float(v[0] - r[0]), 1) if r is not None and p1_idx is not None and arr_idx >= p1_idx else None
-                dy = round(float(v[1] - r[1]), 1) if r is not None and p1_idx is not None and arr_idx >= p1_idx else None
+                dx = (
+                    round(float((v[0] - r[0]) * x_axis_sign), 1)
+                    if r is not None and p1_idx is not None and arr_idx >= p1_idx
+                    else None
+                )
+                dy = (
+                    round(float((v[1] - r[1]) * y_axis_sign), 1)
+                    if r is not None and p1_idx is not None and arr_idx >= p1_idx
+                    else None
+                )
                 item = {"x": x, "y": y, "dx": dx, "dy": dy}
-                if mm_per_px is not None:
-                    item["dx_mm_est"] = round(dx * mm_per_px, 1) if dx is not None else None
-                    item["dy_mm_est"] = round(dy * mm_per_px, 1) if dy is not None else None
+                if in_per_px is not None:
+                    item["dx_in_est"] = round(dx * in_per_px, 2) if dx is not None else None
+                    item["dy_in_est"] = round(dy * in_per_px, 2) if dy is not None else None
                 result[name] = item
             return result
 
@@ -701,7 +850,8 @@ class SwingInferenceService:
                 return None
             return {"x": sanitized[0], "y": sanitized[1]}
 
-        return {
+        stage_started_at = perf_counter()
+        result = {
             "video": {
                 "path": video_path,
                 "fps": fps,
@@ -711,6 +861,24 @@ class SwingInferenceService:
                 "stride": stride,
             },
             "calibration": scale_info,
+            "coordinate_system": {
+                "reference_phase": "Address",
+                "reference_frame": int(p1_frame_id) if p1_frame_id is not None else None,
+                "axes": {
+                    "x": {
+                        "source_view": "face_on",
+                        "positive": "toward lead side",
+                        "negative": "toward trail side",
+                        "note": "Signed from face-on image delta relative to Address, normalized by inferred lead side.",
+                    },
+                    "y": {
+                        "source_view": "face_on",
+                        "positive": "upward",
+                        "negative": "downward",
+                        "note": "Signed from face-on image delta relative to Address with image-y inverted.",
+                    },
+                },
+            },
             "skeleton": {
                 "format": "coco",
                 "keypoint_names": COCO_KEYPOINT_NAMES,
@@ -732,13 +900,23 @@ class SwingInferenceService:
                     "body_points": _body_points_for_frame(idx),
                     "hip_angle": round(float(body_signals['hip_angle'][idx]), 2) if idx < len(body_signals['hip_angle']) and np.isfinite(body_signals['hip_angle'][idx]) else None,
                     "chest_angle": round(float(body_signals['chest_angle'][idx]), 2) if idx < len(body_signals['chest_angle']) and np.isfinite(body_signals['chest_angle'][idx]) else None,
+                    "hip_y_angle": round(float(body_signals['hip_y_angle'][idx]), 2) if idx < len(body_signals['hip_y_angle']) and np.isfinite(body_signals['hip_y_angle'][idx]) else None,
+                    "chest_y_angle": round(float(body_signals['chest_y_angle'][idx]), 2) if idx < len(body_signals['chest_y_angle']) and np.isfinite(body_signals['chest_y_angle'][idx]) else None,
+                    "hip_y_angle_legacy": round(float(body_signals['hip_y_angle_legacy'][idx])) if idx < len(body_signals['hip_y_angle_legacy']) and np.isfinite(body_signals['hip_y_angle_legacy'][idx]) else None,
+                    "chest_y_angle_legacy": round(float(body_signals['chest_y_angle_legacy'][idx])) if idx < len(body_signals['chest_y_angle_legacy']) and np.isfinite(body_signals['chest_y_angle_legacy'][idx]) else None,
+                    "hip_y_angle_experimental": round(float(body_signals['hip_y_angle_experimental'][idx]), 2) if idx < len(body_signals['hip_y_angle_experimental']) and np.isfinite(body_signals['hip_y_angle_experimental'][idx]) else None,
+                    "chest_y_angle_experimental": round(float(body_signals['chest_y_angle_experimental'][idx]), 2) if idx < len(body_signals['chest_y_angle_experimental']) and np.isfinite(body_signals['chest_y_angle_experimental'][idx]) else None,
                 }
                 for idx, f in enumerate(frames)
             ],
             "events": events,
             "events_raw": None,
             "swing_direction": inferred_direction,
+            "lead_is_right": bool(body_signals.get("lead_is_right", True)),
         }
+        print(f"[TIMING] pipeline.pack_result: {perf_counter() - stage_started_at:.2f}s")
+        print(f"[TIMING] pipeline.total: {perf_counter() - total_started_at:.2f}s | {os.path.basename(video_path)}")
+        return result
 
 
 __all__ = ["SwingInferenceService"]

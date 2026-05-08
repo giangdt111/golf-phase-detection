@@ -291,11 +291,46 @@ def compute_swing_features(
     right_arm_vert = np.nan_to_num(1.0 / (right_arm_horiz + 1e-6), nan=999.0)
     left_forearm_horiz = np.nan_to_num(_angle_ratio(left_wrist, left_elbow), nan=999.0)
     right_forearm_horiz = np.nan_to_num(_angle_ratio(right_wrist, right_elbow), nan=999.0)
-    lead_is_right = right_score >= left_score
-    if swing_direction == "clockwise":
-        lead_is_right = True
-    elif swing_direction == "counterclockwise":
-        lead_is_right = False
+
+    def _infer_lead_side_from_setup() -> Optional[bool]:
+        """Infer lead side from the address/setup geometry.
+
+        In face-on golf videos, the grip midpoint at setup usually sits slightly
+        toward the lead side of the body. We estimate that offset over the early
+        frames and lock the lead side globally for the whole swing.
+
+        Returns:
+            True  -> lead side is subject right side
+            False -> lead side is subject left side
+            None  -> insufficient evidence; caller should fallback
+        """
+        offsets: List[float] = []
+        early_end = max(8, min(n, max(12, n // 5)))
+        for i in range(early_end):
+            if np.any(np.isnan(left_wrist[i])) or np.any(np.isnan(right_wrist[i])):
+                continue
+            if np.any(np.isnan(left_shoulder[i])) or np.any(np.isnan(right_shoulder[i])):
+                continue
+            grip_mid_x = float((left_wrist[i][0] + right_wrist[i][0]) / 2.0)
+            body_mid_x = float((left_shoulder[i][0] + right_shoulder[i][0]) / 2.0)
+            offsets.append(grip_mid_x - body_mid_x)
+        if not offsets:
+            return None
+        median_offset = float(np.median(offsets))
+        if abs(median_offset) < 5.0:
+            return None
+        # Image x larger means the point lies on the subject's left side in a
+        # front-view camera. So a positive offset implies lead side = left.
+        return False if median_offset > 0.0 else True
+
+    lead_is_right = _infer_lead_side_from_setup()
+    if lead_is_right is None:
+        if swing_direction == "clockwise":
+            lead_is_right = True
+        elif swing_direction == "counterclockwise":
+            lead_is_right = False
+        else:
+            lead_is_right = right_score >= left_score
     lead_arm_horiz = right_arm_horiz if lead_is_right else left_arm_horiz
     trail_arm_horiz = left_arm_horiz if lead_is_right else right_arm_horiz
     lead_forearm_horiz = right_forearm_horiz if lead_is_right else left_forearm_horiz
